@@ -53,8 +53,7 @@ class TinyRecursiveTransformer(nn.Module):
         y: torch.Tensor,
         z: torch.Tensor,
         cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None
+        sin: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         One latent_recursion call (Paper Figure 3, Page 5).
@@ -63,8 +62,7 @@ class TinyRecursiveTransformer(nn.Module):
             x: Context state [B, S, D] - anchor from backbone
             y: Solution state [B, S, D] - current answer embedding
             z: Reasoning state [B, S, D] - hidden reasoning path
-            cos, sin: RoPE embeddings [S, head_dim]
-            position_ids: Optional position indices [B, S]
+            cos, sin: RoPE embeddings [1, 1, S, head_dim]
 
         Returns:
             y_new: Updated solution state [B, S, D]
@@ -74,11 +72,11 @@ class TinyRecursiveTransformer(nn.Module):
         # z = net(x + y + z) - direct replacement, no residual
         for _ in range(self.n):
             h = x + y + z          # Additive fusion
-            z = self.block(h, cos, sin, position_ids)  # Direct replacement
+            z = self.block(h, cos, sin)  # Direct replacement
 
         # 1 time y update (Prediction Mode)
         # y = net(y + z) - x is completely excluded, not masked!
         h = y + z                  # x excluded
-        y = self.block(h, cos, sin, position_ids)  # Direct replacement
+        y = self.block(h, cos, sin)  # Direct replacement
 
         return y, z

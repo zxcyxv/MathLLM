@@ -38,9 +38,10 @@ class RotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len)
+        # Return shape: [1, 1, S, head_dim] for broadcasting with [B, num_heads, S, head_dim]
         return (
-            self.cos_cached[:seq_len].to(x.dtype),
-            self.sin_cached[:seq_len].to(x.dtype)
+            self.cos_cached[:seq_len].to(x.dtype)[None, None, :, :],
+            self.sin_cached[:seq_len].to(x.dtype)[None, None, :, :]
         )
 
 
@@ -55,24 +56,19 @@ def apply_rotary_pos_emb(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
-    sin: torch.Tensor,
-    position_ids: Optional[torch.Tensor] = None
+    sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Apply rotary position embedding to query and key tensors.
+    Simplified Qwen2-style implementation using broadcasting.
 
     Args:
         q, k: [B, num_heads, S, head_dim]
-        cos, sin: [S, head_dim] or [B, S, head_dim]
-        position_ids: Optional position indices
-    """
-    if position_ids is not None:
-        cos = cos[position_ids].unsqueeze(1)  # [B, 1, S, head_dim]
-        sin = sin[position_ids].unsqueeze(1)
-    else:
-        cos = cos.unsqueeze(0).unsqueeze(0)  # [1, 1, S, head_dim]
-        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos, sin: [1, 1, S, head_dim] (pre-shaped for broadcasting)
 
+    Returns:
+        q_embed, k_embed: RoPE-applied tensors [B, num_heads, S, head_dim]
+    """
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
@@ -117,7 +113,6 @@ class TRMAttention(nn.Module):
         x: torch.Tensor,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
         is_causal: bool = True
     ) -> torch.Tensor:
         B, S, D = x.shape
@@ -129,7 +124,7 @@ class TRMAttention(nn.Module):
 
         # Apply RoPE (critical for language modeling!)
         if cos is not None and sin is not None:
-            q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # Scaled Dot-Product Attention (Flash Attention backend)
         attn_out = F.scaled_dot_product_attention(
@@ -175,19 +170,17 @@ class TRMBlock(nn.Module):
         h: torch.Tensor,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
         is_causal: bool = True
     ) -> torch.Tensor:
         """
         Args:
             h: Pre-fused input (x+y+z or y+z) [B, S, D]
-            cos, sin: RoPE embeddings
-            position_ids: Optional position indices
+            cos, sin: RoPE embeddings [1, 1, S, head_dim]
         Returns:
             output: Processed state [B, S, D]
         """
         # Attention with RoPE
-        h = h + self.attn(self.norm1(h), cos, sin, position_ids, is_causal)
+        h = h + self.attn(self.norm1(h), cos, sin, is_causal)
 
         # SwiGLU FFN
         h = h + self.mlp(self.norm2(h))

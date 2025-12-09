@@ -58,15 +58,15 @@ def test_trm_components():
     print(f"  head_dim: {head_dim}")
     print(f"  cos:    {cos.shape}")
     print(f"  sin:    {sin.shape}")
-    assert cos.shape == (S, head_dim), "cos shape mismatch"
-    assert sin.shape == (S, head_dim), "sin shape mismatch"
+    # Shape: [1, 1, S, head_dim] for broadcasting with [B, num_heads, S, head_dim]
+    assert cos.shape == (1, 1, S, head_dim), "cos shape mismatch"
+    assert sin.shape == (1, 1, S, head_dim), "sin shape mismatch"
     print("  ✓ RoPE shapes correct")
 
     # 3. TinyRecursiveTransformer (Level 3: Latent Recursion)
     print("\n[3] TinyRecursiveTransformer (with RoPE)")
     engine = TinyRecursiveTransformer(config).to(device)
-    position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-    y_new, z_new = engine(x, y, z, cos, sin, position_ids)
+    y_new, z_new = engine(x, y, z, cos, sin)
     print(f"  y_new:  {y_new.shape}")
     print(f"  z_new:  {z_new.shape}")
     assert y_new.shape == (B, S, config.d_lat), "y_new shape mismatch"

@@ -99,8 +99,7 @@ class QwenTRM(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None
+        z: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
         """
         One deep_recursion call (Paper Figure 3).
@@ -111,7 +110,6 @@ class QwenTRM(nn.Module):
             labels: Target labels [B, S] (for training)
             y: Solution state from previous step [B, S, D] (None for first step)
             z: Reasoning state from previous step [B, S, D] (None for first step)
-            position_ids: Position IDs [B, S] (auto-generated if None)
 
         Returns:
             dict containing:
@@ -123,13 +121,8 @@ class QwenTRM(nn.Module):
         assert self.backbone is not None, "Backbone not set. Call set_backbone() first."
 
         B, S = input_ids.shape
-        device = input_ids.device
 
-        # 1. Generate position IDs if not provided
-        if position_ids is None:
-            position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
-
-        # 2. Encode with Qwen backbone (frozen)
+        # 1. Encode with Qwen backbone (frozen)
         with torch.no_grad():
             backbone_output = self.backbone(
                 input_ids=input_ids,
@@ -152,10 +145,10 @@ class QwenTRM(nn.Module):
         # T-1 times: "think" without gradient (memory efficient)
         with torch.no_grad():
             for _ in range(self.T - 1):
-                y, z = self.engine(x, y, z, cos, sin, position_ids)
+                y, z = self.engine(x, y, z, cos, sin)
 
         # Last 1 time: with gradient (for learning)
-        y, z = self.engine(x, y, z, cos, sin, position_ids)
+        y, z = self.engine(x, y, z, cos, sin)
 
         # 7. Compute logits
         logits = self.heads(y)
