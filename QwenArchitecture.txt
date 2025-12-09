@@ -1,0 +1,79 @@
+# Model Architecture Specification: Qwen-2.5-Math-7B-Instruct
+
+## 1. Overview
+**Qwen-2.5-Math-7B-Instruct**는 Alibaba Cloud의 Qwen-2.5를 기반으로 수학적 추론(Mathematical Reasoning)에 특화된 SFT(Supervised Fine-Tuning) 모델이다. 구조적으로는 **Decoder-only Transformer** 아키텍처를 따르며, Llama 계열의 최신 기법(GQA, RoPE, SwiGLU)을 채용하여 연산 효율성과 긴 문맥 처리 능력을 극대화했다.
+
+본 프로젝트에서는 이 모델을 **Semantic Encoder ($f_{enc}$)** 및 **Initial Solver**로 정의하고, TRM(Tiny Recursive Model)의 입력 공간(Input Space)을 생성하는 Backbone으로 사용한다.
+
+---
+
+## 2. Global Hyperparameters
+TRM 모듈과의 차원 정합성을 위해 아래 제원을 엄수해야 한다.
+
+| Hyperparameter | Value | Variable | Description |
+| :--- | :--- | :--- | :--- |
+| **Parameters** | ~7.61B | - | Non-embedding params: ~6.53B |
+| **Hidden Size** | **3,584** | $d_{model}$ | **주의:** 일반적인 7B 모델(4096)과 다름. TRM Projection 시 필수 참조. |
+| **Intermediate Size** | 18,944 | $d_{ff}$ | MLP 확장 차원 (SwiGLU 적용) |
+| **Num Layers** | 28 | $L$ | Transformer Block의 깊이 |
+| **Attn Heads (Q)** | 28 | $H_q$ | Query Head 개수 |
+| **KV Heads** | **4** | $H_{kv}$ | **GQA 적용**. 7:1 비율로 KV 공유 |
+| **Head Dimension** | 128 | $d_{head}$ | $d_{model} / H_q = 3584 / 28 = 128$ |
+| **Vocab Size** | 151,936 | $V$ | Byte-level BPE 기반의 대용량 Vocab |
+| **Max Position** | 32,768 (Base) | $L_{seq}$ | RoPE Extrapolation으로 최대 128k 지원 |
+| **RoPE Base** | 1,000,000.0 | $\theta$ | 고주파수 억제 계수 (Long Context 대응) |
+
+---
+
+## 3. Core Architectural Components
+
+### A. Grouped Query Attention (GQA)
+표준 Multi-Head Attention(MHA) 대신 GQA를 사용하여 Inference 시 **KV Cache의 메모리 점유율을 1/7로 감소**시킨다. 이는 TRM의 재귀 연산 중 발생할 수 있는 메모리 병목을 완화하는 데 유리하다.
+
+* **Structure:**
+    Query 헤드 $H_q=28$개를 4개의 그룹으로 나누고, 각 그룹(7개 Query)이 1개의 Key/Value 헤드($H_{kv}=4$)를 공유한다.
+* **Formula:**
+    $$\text{Attention}(Q_i, K_g, V_g) = \text{softmax}\left(\frac{Q_i K_g^T}{\sqrt{d_head}}\right) V_g$$
+    where $g = \lfloor \frac{i}{7} \rfloor$, $i \in \{0, \dots, 27\}$
+
+### B. Rotary Positional Embeddings (RoPE)
+절대 위치 임베딩을 사용하지 않고, Query와 Key 벡터를 복소 평면상에서 회전시켜 상대적 위치 정보를 인코딩한다. 이는 수식의 논리적 순서와 장거리 의존성(Long-range Dependency) 학습에 필수적이다.
+
+* **Implementation:**
+    위치 $m$에 대해, 벡터 쌍 $(x_1, x_2)$를 각도 $m\theta_i$만큼 회전시킨다.
+    $$\begin{pmatrix} x'_1 \\ x'_2 \end{pmatrix} = \begin{pmatrix} \cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i \end{pmatrix} \begin{pmatrix} x_1 \\ x_2 \end{pmatrix}$$
+    Qwen-2.5는 $\theta_{base} = 10^6$을 사용하여 매우 긴 문맥에서도 위치 정보가 소실되지 않도록 설계되었다.
+
+### C. SwiGLU Activation (in FFN)
+Feed-Forward Network에서 기존의 ReLU나 GeLU 대신 **Swish-Gated Linear Unit**을 사용한다. 이는 GLU의 Gating 메커니즘에 Swish 비선형성을 결합하여 학습 안정성과 성능을 높인다.
+
+* **Formula:**
+    $$\text{FFN}(x) = ((\text{Swish}_{\beta}(xW_1)) \otimes (xV_1))W_2$$
+    * $W_1, V_1$: Input $\to$ Intermediate ($3584 \to 18944$)
+    * $W_2$: Intermediate $\to$ Output ($18944 \to 3584$)
+    * $\otimes$: Element-wise multiplication
+
+### D. RMSNorm (Pre-Normalization)
+Layer Normalization에서 평균(Mean) 보정을 제거하고 RMS(Root Mean Square)로만 정규화한다. 이는 연산량을 줄이고, 특히 깊은 네트워크에서의 Gradient vanishing/exploding을 방지한다.
+
+* **Formula:**
+    $$\bar{x}_i = \frac{x_i}{\sqrt{\frac{1}{d} \sum_{j=1}^d x_j^2 + \epsilon}} \cdot \gamma_i$$
+    TRM 모듈로 들어가기 전, Qwen의 마지막 Hidden State는 반드시 이 RMSNorm을 통과한 상태여야 분포가 안정적이다.
+
+---
+
+## 4. Integration Interface for TRM
+
+TRM(Tiny Recursive Model)과 결합 시, 아래의 데이터 흐름(Data Flow)을 준수해야 한다.
+
+1.  **Extraction Point:**
+    * Qwen의 마지막 Transformer Layer (`layers.27`)의 출력값.
+    * `final_layernorm` (RMSNorm)을 통과하기 **전/후** 중, **통과 전(Pre-LN)** 상태를 가져와 TRM 내부에서 별도로 Norm을 거치거나, **통과 후(Post-LN)** 상태를 Projection하는 것이 일반적임. 본 프로젝트에서는 **Post-LN 상태**를 사용한다.
+    
+2.  **Projection (Bottleneck):**
+    * Input: `[Batch, Seq, 3584]` (Qwen Output)
+    * Operation: `Linear(3584, 1024)` + `RMSNorm`
+    * Output: `[Batch, Seq, 1024]` (TRM Input Context $x$)
+
+3.  **KV Caching Strategy:**
+    * Qwen은 TRM의 **Static Context** 역할을 하므로, Inference 시 단 한 번만 Forward Pass를 수행하고 그 때 생성된 KV Cache(for Qwen layers)는 유지하거나, TRM이 Qwen 내부를 다시 참조하지 않으므로 메모리에서 해제(Offload) 가능하다. (본 아키텍처에서는 TRM이 $x$ 벡터만 참조하므로 Qwen KV Cache는 유지할 필요가 없음).

@@ -1,0 +1,57 @@
+구현 명세서: Qwen-TRM Integrated ModelPart 1. Architectural Topology & State Space Definition1. Overview본 프로젝트의 목표는 Qwen-2.5-Math-7B의 강력한 표현 학습(Representation Learning) 능력을 **TRM(Tiny Recursive Model)**의 무한한 연산 깊이(Computational Depth)와 결합하여, 파라미터 증량 없이 추론 능력을 극대화하는 것입니다.기존 LLM의 Feed-Forward 방식이 가진 고정된 연산량의 한계를 극복하기 위해, 모델을 **Semantic Encoder (Qwen)**와 **Recursive Reasoner (TRM)**로 이원화합니다.2. High-Level Architecture전체 시스템은 정보의 흐름에 따라 세 가지 핵심 모듈로 구분됩니다.$$\text{System}(I) = \mathcal{D}_{Head}(\mathcal{R}_{TRM}(\mathcal{E}_{Backbone}(I)))$$Semantic Encoder ($\mathcal{E}_{Backbone}$): Qwen-2.5-Math-7B역할: 입력 텍스트의 복잡한 문맥과 수학적 의미를 고차원 매니폴드 상에 매핑합니다.출력: Contextual State $x$.State Projection Interface ($\mathcal{P}$):역할: Backbone의 비대한 차원(3584)을 TRM의 효율적인 Latent Space(예: 1024)로 압축합니다. 이는 Information Bottleneck 원리에 따라 불필요한 노이즈를 제거하고 핵심 추론 정보만 남기는 역할을 합니다.Recursive Reasoner ($\mathcal{R}_{TRM}$):역할: 압축된 정보 $x$를 바탕으로, 잠재 상태 $z$와 해답 상태 $y$를 재귀적으로 갱신하며 논리적 경로를 탐색합니다. (Part 2에서 상세 구현)3. Dimensionality & State Specification (상태 공간 명세)TRM 논문에서 강조하듯, 이 모델은 입력을 단순히 통과시키는 것이 아니라 상태($x, y, z$)를 관리해야 합니다1111. Qwen과 TRM 사이의 차원 불일치를 해결하고 연산 효율을 확보하기 위해 다음과 같이 차원을 정의합니다.A. HyperparametersParameterValueNotationDescriptionBackbone Dim3,584$D_{enc}$Qwen-2.5-Math-7B의 Hidden SizeTRM Latent Dim1,024$D_{lat}$추론 엔진 내부의 처리 차원 (VRAM 효율 및 압축 효과 고려)Vocab Size151,936$V$Qwen Tokenizer SpecRecursion Depth$n=6$$n$Inner Loop 횟수 (Latent Reasoning) 2Supervision Steps$T=3$$T$Outer Loop 횟수 (Deep Supervision) 3B. State Variables DefinitionTRM 내부에서 순환하게 될 세 가지 핵심 벡터 $(x, y, z)$를 수학적으로 정의합니다.Context State ($x \in \mathbb{R}^{B \times S \times D_{lat}}$)정의: 문제(Question)에 대한 불변의 의미론적 표현(Invariant Semantic Representation).출처: Qwen의 마지막 Hidden State를 Projection한 값.수식: $x = \text{RMSNorm}(W_{proj} \cdot h_{Qwen} + b_{proj})$특징: 재귀 과정(Loop) 내내 값이 변하지 않으며(Freeze), 추론의 기준점(Anchor) 역할을 수행합니다.Solution State ($y \in \mathbb{R}^{B \times S \times D_{lat}}$)정의: 현재 단계(step $t$)에서 모델이 생각하는 "잠정적인 정답"의 임베딩.초기화: $y_0 = \vec{0}$ (Zero Initialization) 또는 학습 가능한 쿼리 벡터.갱신: 외부 감독 루프(Outer Loop)에서 명시적으로 업데이트됨. 최종적으로 Logit으로 변환되어 정답 토큰을 생성.Reasoning State ($z \in \mathbb{R}^{B \times S \times D_{lat}}$)정의: 해답 $y$에 도달하기 위한 논리적 사고의 궤적(Trajectory)을 담고 있는 잠재 변수.초기화: $z_0 = x$ (문제 그 자체에서 추론 시작) 또는 $\vec{0}$.특징: 내부 재귀 루프(Inner Loop)에서 $n$번 동안 가장 빈번하게 갱신되며, 외부 관찰자(Loss)에게는 보이지 않는 Hidden Reasoning Path입니다.4. Interface Module Implementation (접합부 구현)이 파트는 modeling_qwen2.py 등의 기존 코드를 수정하지 않고, Wrapper Class 형태로 구현하여 모듈성을 확보합니다.Pythonimport torch
+import torch.nn as nn
+from transformers import Qwen2ForCausalLM, Qwen2Config
+
+class TRMInterface(nn.Module):
+    """
+    Acts as the bridge between the frozen Qwen backbone and the trainable TRM engine.
+    Manages dimensionality reduction (Information Bottleneck).
+    """
+    def __init__(self, config: Qwen2Config, trm_dim: int = 1024):
+        super().__init__()
+        self.backbone_dim = config.hidden_size  # 3584
+        self.trm_dim = trm_dim
+        
+        # 1. Projection Layer (The Bottleneck)
+        # Reduces dimensionality to force feature selection
+        self.projector = nn.Sequential(
+            nn.Linear(self.backbone_dim, self.trm_dim, bias=False),
+            nn.RMSNorm(self.trm_dim, eps=config.rms_norm_eps)
+        )
+        
+        # 2. Initialization Strategy for States y and z
+        # Learnable initial states can sometimes outperform zero-init
+        self.y_init = nn.Parameter(torch.zeros(1, 1, self.trm_dim))
+        self.z_init_strategy = "copy_x" # Strategy: start reasoning from the context x
+
+    def extract_context(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: Output from Qwen [Batch, Seq, 3584]
+        Returns:
+            x_latent: Projected context [Batch, Seq, 1024]
+        """
+        # Detach gradients from backbone to save memory if we are freezing Qwen
+        # If LoRA is used on Qwen, remove .detach()
+        x_raw = hidden_states 
+        
+        x_latent = self.projector(x_raw)
+        return x_latent
+
+    def initialize_states(self, x_latent: torch.Tensor):
+        """
+        Initializes y_0 and z_0 based on the batch size and sequence length of x.
+        """
+        batch_size, seq_len, _ = x_latent.shape
+        
+        # y_0: Starts as a neutral/empty state (or learnable query)
+        y_0 = self.y_init.expand(batch_size, seq_len, -1)
+        
+        # z_0: Starts with the problem context itself
+        if self.z_init_strategy == "copy_x":
+            z_0 = x_latent.clone()
+        else:
+            z_0 = torch.zeros_like(x_latent)
+            
+        return y_0, z_0
+5. Part 1 Summary & TransitionPart 1에서는 거대한 Qwen 모델을 입력 인코더로 규정하고, 이를 TRM이 처리할 수 있는 컴팩트한 Latent Space($D_{lat}=1024$)로 변환하는 구조를 설계했습니다.핵심은 3584차원의 $x$를 단순히 줄이는 것이 아니라, 추론에 필요한 핵심 정보만을 $x$에 남기고(Bottleneck), 나머지 복잡한 연산은 TRM의 $z$ 공간에서 $n \times T$ 횟수만큼 반복 수행하도록 유도하는 것입니다.

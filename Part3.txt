@@ -1,0 +1,128 @@
+구현 명세서: Qwen-TRM Integrated ModelPart 3. Deep Supervision, ACT, and Training Integration1. Output Heads & Loss Definition엔진의 출력 상태($y$)를 해석하기 위해 두 개의 헤드가 필요합니다.Language Head ($f_{vocab}$): $D_{lat} \rightarrow V_{vocab}$현재의 잠재 해답 $y$를 실제 토큰 확률로 변환합니다.Halting Head ($f_{halt}$): $D_{lat} \rightarrow 1$ACT(Adaptive Computation Time)를 위한 헤드입니다. 모델이 "이제 충분히 생각했고 정답을 찾았다"고 판단하면 높은 확률을 출력합니다.논문 Section 4.6에 따라 복잡한 Q-Learning 대신 Binary Classification으로 단순화합니다2.Pythonclass TRMHeads(nn.Module):
+    def __init__(self, d_lat, vocab_size):
+        super().__init__()
+        # 1. LM Head: Projects y back to vocabulary space
+        self.lm_head = nn.Linear(d_lat, vocab_size, bias=False)
+        
+        # 2. Halting Head: Decides if reasoning is sufficient
+        # Input: y (current answer state)
+        self.halt_head = nn.Sequential(
+            nn.Linear(d_lat, d_lat // 2),
+            nn.SiLU(),
+            nn.Linear(d_lat // 2, 1) # Output logit for sigmoid
+        )
+
+    def forward(self, y):
+        logits = self.lm_head(y)
+        halt_logit = self.halt_head(y)
+        return logits, halt_logit
+2. The Integrated Model (QwenTRM)Part 1(Interface)과 Part 2(Engine), 그리고 위의 Heads를 결합한 최종 모델 클래스입니다.핵심 설계: Truncated Recursive Gradient논문의 알고리즘 3에 따라, 각 Supervision Step마다 역전파(backward)를 수행한 후, 다음 스텝으로 넘어갈 때 상태 변수($y, z$)를 detach() 처리합니다. 이는 GPU 메모리를 아끼면서도 논리적 깊이를 무한히 확장할 수 있게 하는 핵심 테크닉입니다.Pythonimport torch
+import torch.nn as nn
+from transformers import Qwen2PreTrainedModel, Qwen2Model
+
+class QwenTRM(Qwen2PreTrainedModel):
+    def __init__(self, config, trm_args):
+        super().__init__(config)
+        self.trm_args = trm_args
+        
+        # Part 1: Backbone & Interface
+        # Load Qwen backbone (can be frozen)
+        self.backbone = Qwen2Model(config)
+        self.interface = TRMInterface(config, trm_dim=trm_args.d_lat)
+        
+        # Part 2: Recursive Engine
+        self.engine = TinyRecursiveTransformer(
+            d_lat=trm_args.d_lat, 
+            num_heads=trm_args.num_heads, 
+            n_recursion=trm_args.n_recursion
+        )
+        
+        # Part 3: Heads
+        self.heads = TRMHeads(trm_args.d_lat, config.vocab_size)
+        
+        # Loss Functions
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        # 1. Encode with Qwen (Context Extraction)
+        # We assume Qwen is used purely as an encoder here.
+        with torch.no_grad(): # Or enable grad if finetuning Qwen
+            outputs = self.backbone(input_ids, attention_mask=attention_mask)
+            hidden_states = outputs.last_hidden_state
+        
+        # 2. Initialize TRM States
+        # x: Context (Static), y: Answer, z: Reasoning
+        x = self.interface.extract_context(hidden_states)
+        y, z = self.interface.initialize_states(x)
+        
+        # Precompute static x features for efficient recursion (Part 2 Optimization)
+        self.engine.precompute_x(x)
+
+        total_loss = 0
+        final_logits = None
+        
+        # 3. Deep Supervision Loop
+        # Iterate T times (Supervision Steps)
+        # Note: In inference, we loop until halt or max_steps.
+        steps = self.trm_args.t_supervision if labels is not None else self.trm_args.max_inference_steps
+        
+        for step in range(steps):
+            # Run one recursive process (Inner loop n times)
+            # Returns updated y and z
+            y, z = self.engine.forward_recursion_process(x, y, z)
+            
+            # Compute Outputs
+            logits, halt_logit = self.heads(y)
+            final_logits = logits
+            
+            # --- Training Logic ---
+            if labels is not None:
+                # A. Prediction Loss
+                # Shift logits and labels for Causal LM task
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                step_ce_loss = self.ce_loss(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                
+                # B. Halting Loss (ACT)
+                # Target: 1 if prediction is correct (matches labels), else 0
+                # Creating a soft target based on token accuracy
+                preds = shift_logits.argmax(dim=-1)
+                accuracy = (preds == shift_labels).float().mean() # Token-level accuracy
+                halt_target = (accuracy > 0.99).float() # Threshold for "Correct Answer"
+                step_halt_loss = self.bce_loss(halt_logit.mean(), halt_target) # Simplified block-level halt
+                
+                # Accumulate Loss
+                # Paper suggests immediate backward per step or accumulation.
+                # Here we accumulate for standard PyTorch loop compatibility.
+                total_loss += step_ce_loss + 0.1 * step_halt_loss # Alpha=0.1 weighting
+                
+                # C. Detach for Truncated BPTT
+                # Crucial: Break the graph between supervision steps to prevent OOM
+                y = y.detach()
+                z = z.detach()
+            
+            # --- Inference Logic ---
+            else:
+                halt_prob = torch.sigmoid(halt_logit).mean()
+                if halt_prob > 0.5: # Halt threshold
+                    break
+        
+        return (total_loss, final_logits) if labels is not None else final_logits
+3. Training Strategy AnalysisA. Truncated BPTT via detach()위 코드의 핵심은 y = y.detach(), z = z.detach()입니다.이유: TRM의 총 깊이는 $n \times T$입니다. 만약 $n=6, T=16$이라면 96-layer 깊이의 그래프가 생성됩니다. 이를 한 번에 역전파하면 VRAM이 터집니다.해결: 각 Supervision Step($t$)마다 Loss를 계산하고, 그 시점까지의 그래디언트만 흐르게 한 뒤, 다음 단계($t+1$)로는 **값(Value)**만 넘기고 **그래디언트 고리(Graph)**는 끊습니다.효과: 모델은 "현재의 $z$상태에서 출발하여 $n$번 더 생각했을 때 정답에 가까워지는 법"을 국소적으로 학습하며, 이를 반복하여 전체적인 긴 추론 과정을 완성합니다.B. Loss Landscape$$\mathcal{L}_{total} = \sum_{t=1}^{T} (\mathcal{L}_{CE}(y_t, \text{Target}) + \lambda \mathcal{L}_{BCE}(h_t, \mathbb{I}(y_t = \text{Target})))$$초반 스텝($t=1$)에서는 $z$가 덜 성숙했으므로 Loss가 높게 발생합니다.후반 스텝($t=T$)으로 갈수록 $z$가 정제되며 Loss가 낮아집니다.ACT Loss는 모델이 "정답을 맞췄을 때 멈추는 법"을 학습하게 하여, 추론 효율성을 스스로 조절하게 합니다.4. Inference Strategy: Dynamic Depth추론 시에는 고정된 $T$를 돌 필요 없이, 모델이 확신할 때 멈출 수 있습니다.Pythondef generate_with_reasoning(model, input_ids, max_steps=16, threshold=0.8):
+    # ... Init Steps ...
+    for step in range(max_steps):
+        y, z = model.engine.forward_recursion_process(x, y, z)
+        logits, halt_logit = model.heads(y)
+        
+        # Check Halting Condition
+        halt_prob = torch.sigmoid(halt_logit).mean().item()
+        
+        print(f"Step {step}: Halting Prob = {halt_prob:.4f}")
+        
+        if halt_prob > threshold:
+            print("Reasoning Converged via ACT.")
+            break
+            
+    return logits.argmax(dim=-1)
+이 방식은 쉬운 문제에는 얕은 깊이(적은 연산)로, 어려운 문제에는 깊은 깊이(많은 연산)로 대응하는 Adaptive Inference를 구현합니다.Summary of Full SpecificationTopology (Part 1): Qwen(3584) $\rightarrow$ Bottleneck(1024) $\rightarrow$ Init States $[x, y, z]$.Engine (Part 2): Split-Fusion Attention을 적용한 Tiny Transformer가 $n$번의 내부 재귀를 통해 $z$를 정제.Control (Part 3): Deep Supervision을 통한 단계별 학습과 ACT를 통한 동적 추론 제어.
