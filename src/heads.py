@@ -55,6 +55,15 @@ class TRMHeads(nn.Module):
         with torch.no_grad():
             # Get Qwen weights: [vocab_size, 3584]
             W_qwen = qwen_lm_head.weight.float()
+            qwen_vocab_size = W_qwen.shape[0]
+            trm_vocab_size = self.config.vocab_size
+
+            # Handle vocab size mismatch (Qwen may have different vocab size)
+            if qwen_vocab_size != trm_vocab_size:
+                print(f"[TRMHeads] Vocab size mismatch: Qwen={qwen_vocab_size}, TRM config={trm_vocab_size}")
+                # Use the smaller vocab size
+                min_vocab = min(qwen_vocab_size, trm_vocab_size)
+                W_qwen = W_qwen[:min_vocab, :]
 
             # SVD: W = U @ diag(S) @ V^T
             # U: [vocab_size, vocab_size], S: [min(V,3584)], V: [3584, 3584]
@@ -66,6 +75,12 @@ class TRMHeads(nn.Module):
                 # Reconstruct compressed weights: W_trm = U @ diag(S)
                 # This gives us [vocab_size, 1024]
                 W_trm = U @ torch.diag(S)
+
+                # If TRM vocab is larger, pad with zeros
+                if trm_vocab_size > W_trm.shape[0]:
+                    padding = torch.zeros(trm_vocab_size - W_trm.shape[0], W_trm.shape[1],
+                                         dtype=W_trm.dtype, device=W_trm.device)
+                    W_trm = torch.cat([W_trm, padding], dim=0)
 
                 self.lm_head.weight.copy_(W_trm.to(self.lm_head.weight.dtype))
                 print(f"[TRMHeads] SVD compression successful: {W_qwen.shape} -> {W_trm.shape}")

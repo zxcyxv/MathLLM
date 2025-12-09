@@ -172,11 +172,15 @@ Qwen Output [B, S, 3584] → Linear + RMSNorm → TRM Input [B, S, 1024]
 ```python
 class TRMBlock:
     def forward(self, h, cos, sin):
-        # Attention with RoPE
-        h = h + attn(norm1(h), cos, sin)  # RoPE 적용!
-        h = h + mlp(norm2(h))             # SwiGLU
-        return h
+        # TRM uses DIRECT REPLACEMENT (no residual!)
+        # This is different from standard Transformers
+        h_attn = attn(norm1(h), cos, sin)  # RoPE 적용
+        out = mlp(norm2(h_attn))           # SwiGLU
+        return out  # NO residual connection
 ```
+
+**Zero Init**: Output projections (o_proj, down_proj)를 0으로 초기화하여
+초기 출력이 0이 되도록 함. 이로써 학습 시작 시 안정성 확보.
 
 ### 5. TRM Heads (Qwen 가중치 활용)
 
@@ -221,9 +225,27 @@ class TRMHeads:
 - [x] QwenTRM - Deep Recursion (T-1 no_grad + 1 grad)
 - [x] Trainer - Deep Supervision (N_sup 루프)
 - [x] EMA 구현 및 적용
+- [x] Zero Init for stable training start
+- [x] Direct replacement (no residual) per TRM paper
 
-### Phase 4: Inference (TODO)
-- [ ] Dynamic Depth Inference
+### Phase 4: Evaluation Infrastructure ✅
+- [x] GSM8K evaluation script (`eval/gsm8k_eval.py`)
+- [x] Qwen Zero-shot baseline: **93.71%** on GSM8K
+- [x] TRM Identity Test passed (Zero Init 검증)
+
+### Phase 5: Training Scripts ✅
+- [x] `train_trm.py` - TRM training with Deep Supervision
+- [x] `train_finetune.py` - Last N layers finetuning (baseline)
+- [x] `train_lora.py` - LoRA training (alternative baseline)
+
+### Phase 6: Experiments (IN PROGRESS)
+- [x] TRM training on GSM8K started (Loss 7.08 → 2.57)
+- [ ] Complete TRM training and evaluate
+- [ ] Train finetune baseline for comparison
+- [ ] Dynamic T inference test
+
+### Phase 7: Kaggle Submission (TODO)
+- [ ] Dynamic Depth Inference optimization
 - [ ] Kaggle Submission Format 호환
 - [ ] 5시간 GPU 제한 내 최적화
 
@@ -235,18 +257,23 @@ class TRMHeads:
 MathLLM/
 ├── CLAUDE.md                    # 프로젝트 컨텍스트 (이 파일)
 ├── TRM.pdf                      # TRM 논문 원문
-├── TRM_PAPER_VS_GEMINI_SPEC.md  # 논문 vs Gemini Spec 차이점 문서
-├── test_model.py                # 모델 테스트 스크립트
+├── main.py                      # 메인 실행 스크립트
+├── train_trm.py                 # TRM 학습 스크립트
+├── train_finetune.py            # Last N layers finetuning
+├── train_lora.py                # LoRA 학습 스크립트
 ├── src/
 │   ├── config.py      # TRMConfig (RoPE 설정 포함)
 │   ├── interface.py   # TRMInterface (Backbone → TRM projection)
-│   ├── layers.py      # RotaryEmbedding, TRMBlock (RoPE Attention)
+│   ├── layers.py      # RotaryEmbedding, TRMBlock (RoPE Attention, Zero Init)
 │   ├── engine.py      # TinyRecursiveTransformer (cos/sin 전달)
 │   ├── model.py       # QwenTRM (RoPE 초기화, lm_head 연동)
 │   ├── heads.py       # TRMHeads (Final Norm + SVD 초기화)
 │   ├── train.py       # Trainer + EMA
 │   └── dataset.py     # GSM8K Dataset
-└── notebooks/                   # Kaggle submission (TODO)
+├── eval/
+│   ├── gsm8k_eval.py  # GSM8K 평가 스크립트
+│   └── utils.py       # 평가 유틸리티
+└── checkpoints/                 # 학습된 모델 저장
 ```
 
 ---
@@ -298,6 +325,17 @@ class TRMConfig:
 - T-1번은 no_grad로 메모리 절약
 - 매 supervision step마다 y, z detach
 - Effective depth 672 layers이지만 메모리는 최소화
+
+### Zero Init + Direct Replacement (핵심!)
+> TRM의 TRMBlock은 **residual connection이 없다** (standard Transformer와 다름).
+> `out = mlp(norm2(attn(norm1(h))))` - 입력 h가 출력에 더해지지 않음.
+>
+> Zero Init과 함께: 학습 초기에 block output = 0이 되어 안정적인 시작점 제공.
+> 재귀 루프에서 값이 폭발하지 않음 (y,z = 0으로 시작 → 점진적 학습).
+
+### State Initialization
+- **y**: learnable parameter `y_init` (초기값 0)
+- **z**: `torch.zeros(...)` (x가 아닌 0으로 초기화 - 값 폭발 방지)
 
 ---
 

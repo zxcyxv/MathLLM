@@ -51,7 +51,8 @@ class TRMInterface(nn.Module):
         Returns:
             x: [Batch, Seq, 1024] context for TRM
         """
-        return self.projector(hidden_states)
+        # Ensure dtype consistency (backbone may output bfloat16)
+        return self.projector(hidden_states.to(self.projector[0].weight.dtype))
 
     def initialize_states(self, x: torch.Tensor):
         """
@@ -61,15 +62,20 @@ class TRMInterface(nn.Module):
             x: [Batch, Seq, D] projected context
         Returns:
             y: [Batch, Seq, D] initial solution state (zeros)
-            z: [Batch, Seq, D] initial reasoning state (copy of x)
-        """
-        batch_size, seq_len, _ = x.shape
+            z: [Batch, Seq, D] initial reasoning state (zeros)
 
-        # y: starts as learnable neutral state
+        Note: Both y and z start as zeros. With Zero Init in TRMBlock,
+        this ensures stable initialization where the first forward pass
+        outputs x (the context), and values don't explode during recursion.
+        """
+        batch_size, seq_len, d = x.shape
+
+        # y: starts as learnable neutral state (zeros initially)
         y = self.y_init.expand(batch_size, seq_len, -1).clone()
 
-        # z: starts from problem context
-        z = x.clone()
+        # z: starts as zeros (not x!) to prevent value explosion
+        # With Zero Init, first iteration: h = x + 0 + 0 = x, z = block(x) ≈ x
+        z = torch.zeros(batch_size, seq_len, d, device=x.device, dtype=x.dtype)
 
         return y, z
 

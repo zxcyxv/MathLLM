@@ -36,7 +36,6 @@ class TrainingConfig:
 
     # Batching
     batch_size: int = 4
-    gradient_accumulation_steps: int = 8
 
     # Checkpointing
     save_steps: int = 500
@@ -51,49 +50,58 @@ class EMA:
     """
     Exponential Moving Average for model parameters.
     Paper recommends decay=0.999 for training stability.
+
+    Optimized with torch._foreach_* for vectorized operations.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.model = model
         self.decay = decay
-        self.shadow = {}
-        self.backup = {}
 
-        # Initialize shadow parameters
+        # Store as lists for vectorized operations
+        self.param_names = []
+        self.shadow_params = []
+        self.model_params = []
+
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone()
+                self.param_names.append(name)
+                self.shadow_params.append(param.data.clone())
+                self.model_params.append(param)
+
+        self.backup_params = []
 
     @torch.no_grad()
     def update(self):
-        """Update shadow parameters with EMA"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.shadow[name] = (
-                    self.decay * self.shadow[name] +
-                    (1.0 - self.decay) * param.data
-                )
+        """Update shadow parameters with EMA - Vectorized"""
+        # shadow = decay * shadow + (1 - decay) * param
+        # Using foreach operations for ~2-3x speedup
+        model_data = [p.data for p in self.model_params]
+        torch._foreach_mul_(self.shadow_params, self.decay)
+        torch._foreach_add_(self.shadow_params, model_data, alpha=1.0 - self.decay)
 
     def apply_shadow(self):
-        """Apply shadow parameters to model (for evaluation)"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name]
+        """Apply shadow parameters to model (for evaluation) - Vectorized"""
+        self.backup_params = [p.data.clone() for p in self.model_params]
+        for param, shadow in zip(self.model_params, self.shadow_params):
+            param.data.copy_(shadow)
 
     def restore(self):
-        """Restore original parameters (after evaluation)"""
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data = self.backup[name]
-        self.backup = {}
+        """Restore original parameters (after evaluation) - Vectorized"""
+        for param, backup in zip(self.model_params, self.backup_params):
+            param.data.copy_(backup)
+        self.backup_params = []
 
     def state_dict(self):
-        return {'shadow': self.shadow, 'decay': self.decay}
+        shadow_dict = {name: shadow for name, shadow in zip(self.param_names, self.shadow_params)}
+        return {'shadow': shadow_dict, 'decay': self.decay}
 
     def load_state_dict(self, state_dict):
-        self.shadow = state_dict['shadow']
         self.decay = state_dict['decay']
+        shadow_dict = state_dict['shadow']
+        for i, name in enumerate(self.param_names):
+            if name in shadow_dict:
+                self.shadow_params[i].copy_(shadow_dict[name])
 
 
 class Trainer:

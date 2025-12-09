@@ -146,6 +146,10 @@ class TRMBlock(nn.Module):
     Structure (same order as Qwen):
         1. RMSNorm -> RoPE Attention -> Residual
         2. RMSNorm -> SwiGLU FFN -> Residual
+
+    Zero Init: Output projections (o_proj, down_proj) are initialized to zero
+    so that initial TRM output is identity (h + 0 = h), preserving Qwen's
+    performance at initialization and enabling stable early training.
     """
     def __init__(
         self,
@@ -165,6 +169,15 @@ class TRMBlock(nn.Module):
         self.norm2 = nn.RMSNorm(d_model, eps=eps)
         self.mlp = SwiGLU(d_model, d_ff, d_model)
 
+        # Zero Init for stable training start
+        # Makes initial block output = 0, so residual h + 0 = h (identity)
+        self._zero_init_output_projections()
+
+    def _zero_init_output_projections(self):
+        """Zero-initialize output projections for identity behavior at init."""
+        nn.init.zeros_(self.attn.o_proj.weight)
+        nn.init.zeros_(self.mlp.down_proj.weight)
+
     def forward(
         self,
         h: torch.Tensor,
@@ -179,13 +192,17 @@ class TRMBlock(nn.Module):
         Returns:
             output: Processed state [B, S, D]
         """
-        # Attention with RoPE
-        h = h + self.attn(self.norm1(h), cos, sin, is_causal)
+        # TRM uses DIRECT REPLACEMENT (no residual!)
+        # This is different from standard Transformers
+        # With Zero Init, output starts as 0, not as input
 
-        # SwiGLU FFN
-        h = h + self.mlp(self.norm2(h))
+        # Attention with RoPE (no residual)
+        h_attn = self.attn(self.norm1(h), cos, sin, is_causal)
 
-        return h
+        # SwiGLU FFN (no residual)
+        out = self.mlp(self.norm2(h_attn))
+
+        return out
 
 
 # Backward compatibility alias

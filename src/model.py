@@ -129,7 +129,12 @@ class QwenTRM(nn.Module):
                 attention_mask=attention_mask,
                 output_hidden_states=True
             )
-            hidden_states = backbone_output.last_hidden_state
+            # Handle both CausalLMOutput and BaseModelOutput
+            if hasattr(backbone_output, 'hidden_states') and backbone_output.hidden_states is not None:
+                hidden_states = backbone_output.hidden_states[-1]  # Last layer
+            else:
+                # Fallback for models that return last_hidden_state directly
+                hidden_states = backbone_output.last_hidden_state
 
         # 3. Project to TRM latent space
         x = self.interface.extract_context(hidden_states)
