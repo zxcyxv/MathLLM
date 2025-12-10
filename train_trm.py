@@ -25,47 +25,66 @@ from src.config import TRMConfig
 from src.train import Trainer, TrainingConfig
 
 
-def format_example(example: dict) -> str:
-    """Format GSM8K example for training."""
-    question = example["question"]
-    answer = example["answer"]
+def format_prompt(question: str) -> str:
+    """Format the prompt (user input) - will be masked in labels."""
     return f"""Solve this math problem step by step. Show your work and put your final answer after ####.
 
 Question: {question}
 
-Solution: {answer}"""
+Solution: """
+
+
+def format_response(answer: str) -> str:
+    """Format the response (model output) - will be learned."""
+    return answer
 
 
 class MathDataset(torch.utils.data.Dataset):
     """
     Dataset wrapper for math problems with pre-tokenization.
 
-    Optimization: Tokenizes all examples once at initialization,
-    avoiding repeated tokenizer calls during training.
-    Uses fixed-length padding for consistent tensor shapes (better GPU performance).
+    Key fixes:
+    1. EOS token added at end (teaches model when to stop)
+    2. Prompt portion masked in labels (model learns to answer, not copy question)
+    3. Consistent format between training and inference
     """
 
     def __init__(self, dataset, tokenizer, max_length=1024):
         self.max_length = max_length
 
         # Pre-tokenize all examples with fixed-length padding
-        print("Pre-tokenizing dataset...")
+        print("Pre-tokenizing dataset with proper masking...")
         self.tokenized_data = []
         for example in tqdm(dataset, desc="Tokenizing"):
-            text = format_example(example)
+            question = example["question"]
+            answer = example["answer"]
+
+            # Separate prompt and response
+            prompt = format_prompt(question)
+            response = format_response(answer)
+
+            # Tokenize prompt separately to get its length (for masking)
+            prompt_tokens = tokenizer(prompt, add_special_tokens=False)
+            prompt_len = len(prompt_tokens["input_ids"])
+
+            # Full text = prompt + response + EOS
+            full_text = prompt + response + tokenizer.eos_token
+
+            # Tokenize full text
             tokenized = tokenizer(
-                text,
+                full_text,
                 truncation=True,
                 max_length=max_length,
-                padding="max_length",  # Fixed padding for consistent shapes
+                padding="max_length",
                 return_tensors="pt"
             )
             input_ids = tokenized["input_ids"].squeeze(0)
             attention_mask = tokenized["attention_mask"].squeeze(0)
 
-            # Labels: mask padding with -100
+            # Labels: mask prompt AND padding with -100
             labels = input_ids.clone()
-            labels[attention_mask == 0] = -100
+            labels[:prompt_len] = -100  # Mask prompt (don't learn to predict question)
+            labels[attention_mask == 0] = -100  # Mask padding
 
             self.tokenized_data.append({
                 "input_ids": input_ids,
@@ -118,6 +137,10 @@ def main():
     parser.add_argument("--no-amp", dest="amp", action="store_false",
                         help="Disable AMP, use float32")
 
+    # Resume training
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from (e.g., ./checkpoints/trm/checkpoint-234)")
+
     args = parser.parse_args()
 
     print(f"Loading QwenTRM with backbone: {args.model}")
@@ -141,6 +164,21 @@ def main():
         device="cuda",
         init_lm_head=True
     )
+
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        ckpt_file = os.path.join(args.resume, "trm_model.pt")
+        if os.path.exists(ckpt_file):
+            print(f"[Resume] Loading checkpoint from: {ckpt_file}")
+            state = torch.load(ckpt_file, map_location="cuda", weights_only=False)
+            model.interface.load_state_dict(state['interface'])
+            model.engine.load_state_dict(state['engine'])
+            model.heads.load_state_dict(state['heads'])
+            start_epoch = state.get('epoch', 0)
+            print(f"[Resume] Loaded checkpoint (epoch={start_epoch}, step={state.get('global_step', '?')})")
+        else:
+            print(f"[Resume] Warning: Checkpoint not found at {ckpt_file}, starting fresh")
 
     # Convert TRM components to bfloat16 for AMP compatibility
     # This avoids dtype mismatch warnings and enables fused kernels
