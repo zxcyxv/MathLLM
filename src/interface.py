@@ -33,10 +33,14 @@ class TRMInterface(nn.Module):
         self.backbone_dim = backbone_dim
         self.trm_dim = trm_dim
 
-        # Projection Layer (The Bottleneck)
+        # Projection Layer (The Bottleneck) - upgraded to MLP to reduce information loss
+        # 3584 -> (2 * d_lat) -> d_lat with non-linearity
+        hidden_dim = trm_dim * 2
         self.projector = nn.Sequential(
-            nn.Linear(backbone_dim, trm_dim, bias=False),
-            nn.RMSNorm(trm_dim, eps=eps)
+            nn.Linear(backbone_dim, hidden_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_dim, trm_dim, bias=False),
+            nn.RMSNorm(trm_dim, eps=eps),
         )
 
         # Learnable initial states

@@ -35,6 +35,9 @@ class TRMConfig:
     use_ema: bool = True
     ema_decay: float = 0.999
 
+    # Residual scaling for TRM updates (very small to ensure stability)
+    residual_alpha: float = 0.1
+
     @property
     def d_ff(self) -> int:
         """FFN hidden dimension"""

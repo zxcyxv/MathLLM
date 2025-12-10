@@ -282,6 +282,14 @@ class QwenTRM(nn.Module):
             torch_dtype=torch.bfloat16
         ).to(device)
 
+        # Sync TRM backbone_dim with actual backbone hidden size so that
+        # TRMInterface projection works for both 7B and 1.5B variants.
+        hidden_size = getattr(getattr(backbone, "config", None), "hidden_size", None)
+        if hidden_size is not None:
+            print(f"[QwenTRM] Detected backbone hidden_size={hidden_size}, "
+                  f"setting TRMConfig.backbone_dim accordingly.")
+            config.backbone_dim = hidden_size
+
         # Create model
         model = cls(config=config).to(device)
         model.set_backbone(backbone, init_lm_head=init_lm_head)
