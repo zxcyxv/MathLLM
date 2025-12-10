@@ -193,53 +193,39 @@ class Trainer:
             epoch_loss = 0.0
             num_updates = 0
 
-            # Fast path: no accumulation (no CPU offloading)
-            if acc_steps == 1:
-                for batch_idx, batch in enumerate(self.train_dataloader):
-                    loss = self._training_step(batch)
+            # Collect micro-batches for accumulation
+            micro_batches = []
+
+            for batch_idx, batch in enumerate(self.train_dataloader):
+                micro_batches.append(batch)
+
+                # When we have enough micro-batches, do one accumulated training step
+                if len(micro_batches) == acc_steps:
+                    loss = self._training_step_accumulated(micro_batches)
                     epoch_loss += loss
                     num_updates += 1
+                    micro_batches = []
 
+                    # Logging
                     if self.global_step % self.config.log_steps == 0:
                         self._log_step(loss)
 
+                    # Evaluation
                     if self.eval_dataloader and self.global_step % self.config.eval_steps == 0:
                         self._evaluate()
 
+                    # Checkpointing
                     if self.global_step % self.config.save_steps == 0:
                         self._save_checkpoint()
 
                     self.global_step += 1
-            else:
-                # Slow path: gradient accumulation with CPU offloading
-                micro_batches = []
 
-                for batch_idx, batch in enumerate(self.train_dataloader):
-                    micro_batches.append(batch)
-
-                    if len(micro_batches) == acc_steps:
-                        loss = self._training_step_accumulated(micro_batches)
-                        epoch_loss += loss
-                        num_updates += 1
-                        micro_batches = []
-
-                        if self.global_step % self.config.log_steps == 0:
-                            self._log_step(loss)
-
-                        if self.eval_dataloader and self.global_step % self.config.eval_steps == 0:
-                            self._evaluate()
-
-                        if self.global_step % self.config.save_steps == 0:
-                            self._save_checkpoint()
-
-                        self.global_step += 1
-
-                # Handle remaining micro-batches
-                if micro_batches:
-                    loss = self._training_step_accumulated(micro_batches)
-                    epoch_loss += loss
-                    num_updates += 1
-                    self.global_step += 1
+            # Handle remaining micro-batches (if dataset not divisible by acc_steps)
+            if micro_batches:
+                loss = self._training_step_accumulated(micro_batches)
+                epoch_loss += loss
+                num_updates += 1
+                self.global_step += 1
 
             avg_loss = epoch_loss / max(num_updates, 1)
             print(f"Epoch {epoch + 1}/{self.config.num_epochs} - Avg Loss: {avg_loss:.4f}")
@@ -352,62 +338,9 @@ class Trainer:
     def _training_step(self, batch: Dict[str, torch.Tensor]) -> float:
         """
         Single batch training step (no accumulation).
-        Fast path without CPU offloading.
+        Kept for backwards compatibility.
         """
-        # Move batch to device
-        input_ids = batch['input_ids'].to(self.device)
-        attention_mask = batch.get('attention_mask')
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        labels = batch['labels'].to(self.device)
-
-        # Encode backbone once (frozen)
-        with torch.no_grad():
-            hidden_states = self.model.encode_backbone(input_ids, attention_mask)
-
-        # Compute RoPE once
-        B, S, D = hidden_states.shape
-        cos, sin = self.model.rotary_emb(hidden_states, S)
-
-        # Initialize states
-        y, z = None, None
-        total_loss = 0.0
-
-        # N_sup Deep Supervision Loop
-        N_sup = self.model_config.N_supervision
-
-        for sup_step in range(N_sup):
-            self.optimizer.zero_grad()
-
-            outputs = self.model(
-                labels=labels,
-                y=y,
-                z=z,
-                hidden_states=hidden_states,
-                cos=cos,
-                sin=sin
-            )
-
-            loss = outputs['loss']
-            total_loss += loss.item()
-
-            loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                self.trm_params,
-                self.config.max_grad_norm
-            )
-
-            self.optimizer.step()
-            self.scheduler.step()
-
-            if self.ema is not None:
-                self.ema.update()
-
-            y = outputs['y']
-            z = outputs['z']
-
-        return total_loss / N_sup
+        return self._training_step_accumulated([batch])
 
     def _evaluate(self):
         """Run evaluation with EMA parameters"""
