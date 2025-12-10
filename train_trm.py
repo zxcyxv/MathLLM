@@ -92,6 +92,9 @@ def main():
     parser.add_argument("--n_latent", type=int, default=6, help="Level 3: n")
     parser.add_argument("--T_recursion", type=int, default=3, help="Level 2: T")
     parser.add_argument("--N_supervision", type=int, default=16, help="Level 1: N_sup")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for speedup")
+    parser.add_argument("--gradient_accumulation", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size * this)")
 
     args = parser.parse_args()
 
@@ -117,6 +120,11 @@ def main():
         init_lm_head=True
     )
 
+    # Optional: torch.compile for speedup
+    if args.compile:
+        print("Compiling TRM engine with torch.compile...")
+        model.engine = torch.compile(model.engine, mode="reduce-overhead")
+
     trainable, total = count_trainable_params(model)
     print(f"\nTRM Configuration:")
     print(f"  n_latent (Level 3): {args.n_latent}")
@@ -125,6 +133,7 @@ def main():
     print(f"  Effective depth: {2 * (args.n_latent + 1) * args.T_recursion * args.N_supervision}")
     print(f"  Trainable params: {trainable:,}")
     print(f"  Total params: {total:,}")
+    print(f"  torch.compile: {args.compile}")
 
     # Load dataset
     print(f"\nLoading dataset: {args.dataset}")
@@ -145,8 +154,9 @@ def main():
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=12,
+        pin_memory=True,
+        persistent_workers=True
     )
 
     # Training config
@@ -154,6 +164,7 @@ def main():
         learning_rate=args.lr,
         num_epochs=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation,
         output_dir=args.output_dir,
         log_steps=10,
         save_steps=500,
@@ -169,6 +180,8 @@ def main():
 
     print("\nStarting TRM training...")
     print(f"  Batch size: {args.batch_size}")
+    print(f"  Gradient accumulation: {args.gradient_accumulation}")
+    print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation}")
     print(f"  Learning rate: {args.lr}")
 
     trainer.train()

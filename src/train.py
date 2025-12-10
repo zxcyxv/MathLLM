@@ -36,6 +36,7 @@ class TrainingConfig:
 
     # Batching
     batch_size: int = 4
+    gradient_accumulation_steps: int = 1  # Effective batch = batch_size * accumulation
 
     # Checkpointing
     save_steps: int = 500
@@ -148,13 +149,13 @@ class Trainer:
     def _setup_optimizer(self) -> AdamW:
         """Setup AdamW optimizer for TRM parameters only (Paper: β1=0.9, β2=0.95)"""
         # Only optimize non-backbone parameters
-        trm_params = []
+        self.trm_params = []  # Cache for gradient clipping
         for name, param in self.model.named_parameters():
             if 'backbone' not in name and param.requires_grad:
-                trm_params.append(param)
+                self.trm_params.append(param)
 
         return AdamW(
-            trm_params,
+            self.trm_params,
             lr=self.config.learning_rate,
             betas=(self.config.beta1, self.config.beta2),
             weight_decay=self.config.weight_decay
@@ -162,7 +163,12 @@ class Trainer:
 
     def _setup_scheduler(self) -> CosineAnnealingLR:
         """Setup cosine annealing scheduler"""
-        total_steps = len(self.train_dataloader) * self.config.num_epochs
+        # Account for N_sup optimizer steps per accumulated batch
+        N_sup = self.model_config.N_supervision
+        acc_steps = self.config.gradient_accumulation_steps
+        # With accumulation, we update once per acc_steps batches, N_sup times
+        num_accumulated_batches = len(self.train_dataloader) // acc_steps
+        total_steps = num_accumulated_batches * self.config.num_epochs * N_sup
         return CosineAnnealingLR(
             self.optimizer,
             T_max=total_steps,
@@ -170,100 +176,171 @@ class Trainer:
         )
 
     def train(self):
-        """Main training loop"""
+        """
+        Main training loop with Step-wise Gradient Accumulation.
+
+        Key insight: In TRM's Deep Supervision, we must accumulate gradients
+        WITHIN each supervision step, not across steps. This ensures:
+        1. All micro-batches in the same step use the same weights
+        2. Weights are updated after each supervision step completes
+        3. Next step uses the updated weights (as per paper)
+        """
         self.model.train()
+        acc_steps = self.config.gradient_accumulation_steps
 
         for epoch in range(self.config.num_epochs):
             self.epoch = epoch
             epoch_loss = 0.0
-            num_batches = 0
+            num_updates = 0
 
-            for step, batch in enumerate(self.train_dataloader):
-                loss = self._training_step(batch)
+            # Collect micro-batches for accumulation
+            micro_batches = []
+
+            for batch_idx, batch in enumerate(self.train_dataloader):
+                micro_batches.append(batch)
+
+                # When we have enough micro-batches, do one accumulated training step
+                if len(micro_batches) == acc_steps:
+                    loss = self._training_step_accumulated(micro_batches)
+                    epoch_loss += loss
+                    num_updates += 1
+                    micro_batches = []
+
+                    # Logging
+                    if self.global_step % self.config.log_steps == 0:
+                        self._log_step(loss)
+
+                    # Evaluation
+                    if self.eval_dataloader and self.global_step % self.config.eval_steps == 0:
+                        self._evaluate()
+
+                    # Checkpointing
+                    if self.global_step % self.config.save_steps == 0:
+                        self._save_checkpoint()
+
+                    self.global_step += 1
+
+            # Handle remaining micro-batches (if dataset not divisible by acc_steps)
+            if micro_batches:
+                loss = self._training_step_accumulated(micro_batches)
                 epoch_loss += loss
-                num_batches += 1
-
-                # Logging
-                if self.global_step % self.config.log_steps == 0:
-                    self._log_step(loss)
-
-                # Evaluation
-                if self.eval_dataloader and self.global_step % self.config.eval_steps == 0:
-                    self._evaluate()
-
-                # Checkpointing
-                if self.global_step % self.config.save_steps == 0:
-                    self._save_checkpoint()
-
+                num_updates += 1
                 self.global_step += 1
 
-            avg_loss = epoch_loss / max(num_batches, 1)
+            avg_loss = epoch_loss / max(num_updates, 1)
             print(f"Epoch {epoch + 1}/{self.config.num_epochs} - Avg Loss: {avg_loss:.4f}")
 
-    def _training_step(self, batch: Dict[str, torch.Tensor]) -> float:
+    def _training_step_accumulated(self, micro_batches: list) -> float:
         """
-        Level 1: Deep Supervision (Paper Figure 3).
+        Step-wise Gradient Accumulation for TRM Deep Supervision.
 
-        N_sup times:
-            - Forward (model handles T-1 no_grad + 1 grad internally)
-            - Compute loss
-            - Backward
-            - Optimizer step
-            - Zero grad
-            - EMA update
-            - Pass detached y, z to next step
+        Algorithm:
+        1. Pre-encode all micro-batches with backbone (frozen, once)
+        2. Initialize y, z states for all samples (stored on CPU)
+        3. For each supervision step:
+           a. zero_grad
+           b. For each micro-batch: forward, backward (accumulate gradients)
+           c. optimizer.step (update weights)
+           d. Save y, z states back to CPU for next step
+
+        This ensures all micro-batches in the same step use the SAME weights,
+        and weights are updated BETWEEN steps (matching paper's intention).
         """
-        # Move batch to device
-        input_ids = batch['input_ids'].to(self.device)
-        attention_mask = batch.get('attention_mask')
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        labels = batch['labels'].to(self.device)
-
-        # Initialize states
-        y, z = None, None
+        acc_steps = len(micro_batches)
+        N_sup = self.model_config.N_supervision
         total_loss = 0.0
 
-        # N_sup Deep Supervision Loop
-        N_sup = self.model_config.N_supervision  # 16
+        # 1. Pre-encode all micro-batches with backbone
+        all_hidden_states = []
+        all_labels = []
+        all_cos = []
+        all_sin = []
 
+        with torch.no_grad():
+            for batch in micro_batches:
+                input_ids = batch['input_ids'].to(self.device)
+                attention_mask = batch.get('attention_mask')
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(self.device)
+                labels = batch['labels'].to(self.device)
+
+                hidden_states = self.model.encode_backbone(input_ids, attention_mask)
+
+                # Compute RoPE once per micro-batch
+                B, S, D = hidden_states.shape
+                cos, sin = self.model.rotary_emb(hidden_states, S)
+
+                # Store on CPU to save GPU memory
+                all_hidden_states.append(hidden_states.cpu())
+                all_labels.append(labels.cpu())
+                all_cos.append(cos.cpu())
+                all_sin.append(sin.cpu())
+
+        # 2. Initialize y, z states for all micro-batches (on CPU)
+        all_y = [None] * acc_steps
+        all_z = [None] * acc_steps
+
+        # 3. Deep Supervision Loop
         for sup_step in range(N_sup):
-            # Forward (internally does T-1 no_grad + 1 grad)
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                y=y,
-                z=z
-            )
+            self.optimizer.zero_grad()
+            step_loss = 0.0
 
-            loss = outputs['loss']
-            total_loss += loss.item()
+            # 3a. Accumulate gradients across all micro-batches
+            for i in range(acc_steps):
+                # Load data to GPU (non_blocking for async transfer)
+                hidden_states = all_hidden_states[i].to(self.device, non_blocking=True)
+                labels = all_labels[i].to(self.device, non_blocking=True)
+                cos = all_cos[i].to(self.device, non_blocking=True)
+                sin = all_sin[i].to(self.device, non_blocking=True)
 
-            # Backward
-            loss.backward()
+                # Load states (None on first step, from CPU otherwise)
+                y = all_y[i].to(self.device, non_blocking=True) if all_y[i] is not None else None
+                z = all_z[i].to(self.device, non_blocking=True) if all_z[i] is not None else None
 
-            # Gradient clipping
+                # Forward
+                outputs = self.model(
+                    labels=labels,
+                    y=y,
+                    z=z,
+                    hidden_states=hidden_states,
+                    cos=cos,
+                    sin=sin
+                )
+
+                # Scale loss for accumulation
+                loss = outputs['loss'] / acc_steps
+                step_loss += outputs['loss'].item()  # Log unscaled loss
+
+                # Backward (accumulates gradients)
+                loss.backward()
+
+                # Save states to CPU for next supervision step (non_blocking)
+                all_y[i] = outputs['y'].to('cpu', non_blocking=True)
+                all_z[i] = outputs['z'].to('cpu', non_blocking=True)
+
+            # 3b. Update weights after all micro-batches processed
             torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
+                self.trm_params,
                 self.config.max_grad_norm
             )
-
-            # Optimizer step
             self.optimizer.step()
             self.scheduler.step()
-            self.optimizer.zero_grad()
 
             # EMA update
             if self.ema is not None:
                 self.ema.update()
 
-            # Get detached states for next supervision step
-            y = outputs['y']
-            z = outputs['z']
+            total_loss += step_loss / acc_steps  # Average across micro-batches
 
-        # Return average loss across supervision steps
+        # Return average loss across all supervision steps
         return total_loss / N_sup
+
+    def _training_step(self, batch: Dict[str, torch.Tensor]) -> float:
+        """
+        Single batch training step (no accumulation).
+        Kept for backwards compatibility.
+        """
+        return self._training_step_accumulated([batch])
 
     def _evaluate(self):
         """Run evaluation with EMA parameters"""
@@ -284,15 +361,13 @@ class Trainer:
                     attention_mask = attention_mask.to(self.device)
                 labels = batch['labels'].to(self.device)
 
+                # Encode backbone once, reuse hidden_states
+                hidden_states = self.model.encode_backbone(input_ids, attention_mask)
+
                 # Run full N_sup supervision for evaluation
                 y, z = None, None
                 for _ in range(self.model_config.N_supervision):
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                        y=y, z=z
-                    )
+                    outputs = self.model(labels=labels, y=y, z=z, hidden_states=hidden_states)
                     y = outputs['y']
                     z = outputs['z']
 

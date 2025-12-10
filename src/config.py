@@ -10,10 +10,10 @@ from dataclasses import dataclass
 class TRMConfig:
     """Configuration for TRM (Tiny Recursive Model)"""
 
-    # Backbone dimensions
+    # Backbone dimensions - TRM now matches Qwen exactly
     backbone_dim: int = 3584      # Qwen-2.5-Math-7B hidden size
-    d_lat: int = 1024             # TRM latent dimension
-    num_heads: int = 8            # Attention heads (1024/8 = 128 head_dim, same as Qwen)
+    d_lat: int = 3584             # TRM latent dimension (same as Qwen!)
+    num_heads: int = 28           # Attention heads (3584/28 = 128 head_dim, same as Qwen)
     expansion: int = 4            # FFN expansion ratio
 
     # RoPE settings (same as Qwen for compatibility)
@@ -34,9 +34,6 @@ class TRMConfig:
     # EMA (Paper recommendation)
     use_ema: bool = True
     ema_decay: float = 0.999
-
-    # Residual scaling for TRM updates (very small to ensure stability)
-    residual_alpha: float = 0.1
 
     @property
     def d_ff(self) -> int:

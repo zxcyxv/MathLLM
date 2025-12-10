@@ -23,13 +23,14 @@ class QwenTRM(nn.Module):
 
     Architecture:
         1. Qwen backbone (frozen) - Semantic encoding
-        2. TRMInterface - Dimensionality reduction (3584 -> 1024)
+        2. TRMInterface - State initialization (no projection, same dimension)
         3. TinyRecursiveTransformer - Recursive reasoning with RoPE
-        4. TRMHeads - Token prediction (initialized from Qwen)
+        4. TRMHeads - Token prediction (Qwen lm_head weights copied directly)
 
     Features:
-        - RoPE with same settings as Qwen (theta=1e6, head_dim=128)
-        - LM Head initialized via SVD compression from Qwen
+        - TRM operates at same dimension as Qwen (d_lat = 3584)
+        - RoPE with same settings as Qwen (theta=1e6, head_dim=128, num_heads=28)
+        - LM Head directly uses Qwen's pretrained weights (no SVD needed)
     """
 
     def __init__(
@@ -47,10 +48,10 @@ class QwenTRM(nn.Module):
         # TRM Components
         self.interface = TRMInterface(config)
         self.engine = TinyRecursiveTransformer(config)
-        self.heads = TRMHeads(config)  # Will init from Qwen later
+        self.heads = TRMHeads(config)  # Will copy from Qwen later
 
         # RoPE (same settings as Qwen for compatibility)
-        head_dim = config.d_lat // config.num_heads  # 1024/8 = 128
+        head_dim = config.d_lat // config.num_heads  # 3584/28 = 128
         self.rotary_emb = RotaryEmbedding(
             dim=head_dim,
             max_position_embeddings=config.max_position_embeddings,
@@ -66,11 +67,11 @@ class QwenTRM(nn.Module):
 
         Args:
             backbone: Qwen model (e.g., Qwen2ForCausalLM or Qwen2Model)
-            init_lm_head: Whether to initialize TRM lm_head from Qwen's lm_head
+            init_lm_head: Whether to copy Qwen's lm_head weights to TRM
         """
         self.backbone = backbone
 
-        # Initialize TRM lm_head from Qwen's lm_head via SVD
+        # Copy Qwen's lm_head weights directly (same dimension, no SVD needed)
         if init_lm_head:
             qwen_lm_head = self._get_qwen_lm_head(backbone)
             if qwen_lm_head is not None:
@@ -93,23 +94,78 @@ class QwenTRM(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-    def forward(
+    def encode_backbone(
         self,
         input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Encode input with backbone only (frozen, run once per batch).
+
+        Args:
+            input_ids: Input token IDs [B, S]
+            attention_mask: Attention mask [B, S]
+
+        Returns:
+            hidden_states: Backbone output [B, S, backbone_dim]
+        """
+        assert self.backbone is not None, "Backbone not set. Call set_backbone() first."
+
+        backbone_output = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True
+        )
+        if hasattr(backbone_output, 'hidden_states') and backbone_output.hidden_states is not None:
+            hidden_states = backbone_output.hidden_states[-1]
+        else:
+            hidden_states = backbone_output.last_hidden_state
+
+        return hidden_states
+
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Full encode: backbone + interface projection.
+
+        Args:
+            input_ids: Input token IDs [B, S]
+            attention_mask: Attention mask [B, S]
+
+        Returns:
+            x: Context tensor [B, S, d_lat]
+        """
+        with torch.no_grad():
+            hidden_states = self.encode_backbone(input_ids, attention_mask)
+        x = self.interface.extract_context(hidden_states)
+        return x
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
-        z: Optional[torch.Tensor] = None
+        z: Optional[torch.Tensor] = None,
+        hidden_states: Optional[torch.Tensor] = None,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
         """
         One deep_recursion call (Paper Figure 3).
 
         Args:
-            input_ids: Input token IDs [B, S]
+            input_ids: Input token IDs [B, S] (optional if hidden_states provided)
             attention_mask: Attention mask [B, S]
             labels: Target labels [B, S] (for training)
             y: Solution state from previous step [B, S, D] (None for first step)
             z: Reasoning state from previous step [B, S, D] (None for first step)
+            hidden_states: Pre-computed backbone output [B, S, backbone_dim]
+                          (optional, skips backbone if provided)
+            cos, sin: Pre-computed RoPE embeddings (optional, computed if not provided)
 
         Returns:
             dict containing:
@@ -117,37 +173,28 @@ class QwenTRM(nn.Module):
                 - logits: Token logits [B, S, V]
                 - y: Detached solution state for next step
                 - z: Detached reasoning state for next step
+                - cos, sin: RoPE embeddings for reuse
         """
-        assert self.backbone is not None, "Backbone not set. Call set_backbone() first."
+        # Get hidden_states from backbone or use pre-computed
+        if hidden_states is None:
+            assert input_ids is not None, "Either input_ids or hidden_states must be provided"
+            with torch.no_grad():
+                hidden_states = self.encode_backbone(input_ids, attention_mask)
 
-        B, S = input_ids.shape
-
-        # 1. Encode with Qwen backbone (frozen)
-        with torch.no_grad():
-            backbone_output = self.backbone(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            )
-            # Handle both CausalLMOutput and BaseModelOutput
-            if hasattr(backbone_output, 'hidden_states') and backbone_output.hidden_states is not None:
-                hidden_states = backbone_output.hidden_states[-1]  # Last layer
-            else:
-                # Fallback for models that return last_hidden_state directly
-                hidden_states = backbone_output.last_hidden_state
-
-        # 3. Project to TRM latent space
+        # Project to TRM latent space (runs each supervision step, trainable)
         x = self.interface.extract_context(hidden_states)
 
-        # 4. Initialize states if first supervision step
+        B, S, _ = x.shape
+
+        # Initialize states if first supervision step
         if y is None or z is None:
             y, z = self.interface.initialize_states(x)
 
-        # 5. Get RoPE embeddings
-        cos, sin = self.rotary_emb(x, S)
+        # Get RoPE embeddings (compute once, reuse across supervision steps)
+        if cos is None or sin is None:
+            cos, sin = self.rotary_emb(x, S)
 
-        # 6. Deep Recursion: T-1 times no_grad + 1 time grad
-        # T-1 times: "think" without gradient (memory efficient)
+        # Deep Recursion: T-1 times no_grad + 1 time grad
         with torch.no_grad():
             for _ in range(self.T - 1):
                 y, z = self.engine(x, y, z, cos, sin)
@@ -155,17 +202,19 @@ class QwenTRM(nn.Module):
         # Last 1 time: with gradient (for learning)
         y, z = self.engine(x, y, z, cos, sin)
 
-        # 7. Compute logits
+        # Compute logits
         logits = self.heads(y)
 
-        # 8. Build output
+        # Build output
         output = {
             'logits': logits,
-            'y': y.detach(),  # Detach for next supervision step
+            'y': y.detach(),
             'z': z.detach(),
+            'cos': cos,
+            'sin': sin,
         }
 
-        # 9. Compute loss if training
+        # Compute loss if training
         if labels is not None:
             output['loss'] = self._compute_loss(logits, labels)
 
@@ -282,13 +331,19 @@ class QwenTRM(nn.Module):
             torch_dtype=torch.bfloat16
         ).to(device)
 
-        # Sync TRM backbone_dim with actual backbone hidden size so that
-        # TRMInterface projection works for both 7B and 1.5B variants.
+        # Sync TRM dimensions with actual backbone hidden size
+        # Since TRM now operates at the same dimension as Qwen, both d_lat and backbone_dim must match
         hidden_size = getattr(getattr(backbone, "config", None), "hidden_size", None)
+        num_attention_heads = getattr(getattr(backbone, "config", None), "num_attention_heads", None)
         if hidden_size is not None:
             print(f"[QwenTRM] Detected backbone hidden_size={hidden_size}, "
-                  f"setting TRMConfig.backbone_dim accordingly.")
+                  f"setting TRMConfig.backbone_dim and d_lat accordingly.")
             config.backbone_dim = hidden_size
+            config.d_lat = hidden_size  # TRM operates at same dimension!
+        if num_attention_heads is not None:
+            print(f"[QwenTRM] Detected backbone num_attention_heads={num_attention_heads}, "
+                  f"setting TRMConfig.num_heads accordingly.")
+            config.num_heads = num_attention_heads
 
         # Create model
         model = cls(config=config).to(device)

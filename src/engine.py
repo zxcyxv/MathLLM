@@ -28,7 +28,6 @@ class TinyRecursiveTransformer(nn.Module):
         super().__init__()
         self.config = config
         self.n = config.n_latent  # n = 6
-        self.alpha = config.residual_alpha
 
         # Single shared transformer block with RoPE
         self.block = TRMBlock(
@@ -69,21 +68,17 @@ class TinyRecursiveTransformer(nn.Module):
             y_new: Updated solution state [B, S, D]
             z_new: Updated reasoning state [B, S, D]
         """
-        # Use a very small residual update to keep recursion stable:
-        #   z <- z + alpha * net(x + y + z)
-        #   y <- y + alpha * net(y + z)
-        # where alpha << 1 (from TRMConfig.residual_alpha).
-        alpha = self.alpha
+        # Direct replacement (no residual) per TRM paper:
+        #   z = net(x + y + z)
+        #   y = net(y + z)
 
         # n times z update (Reasoning Mode)
         for _ in range(self.n):
             h = x + y + z                  # Additive fusion
-            delta_z = self.block(h, cos, sin)
-            z = z + alpha * delta_z
+            z = self.block(h, cos, sin)    # Direct replacement
 
         # 1 time y update (Prediction Mode) - x is completely excluded, not masked!
         h = y + z                          # x excluded
-        delta_y = self.block(h, cos, sin)
-        y = y + alpha * delta_y
+        y = self.block(h, cos, sin)        # Direct replacement
 
         return y, z

@@ -28,226 +28,353 @@
 
 파라미터 증량 없이 **재귀적 추론(Recursive Reasoning)**으로 연산 깊이를 확장
 
-### System Pipeline
+### High-Level Architecture (Simplified)
+
+**핵심 변경: TRM이 Qwen과 동일한 차원(3584)에서 동작**
+- Interface projection 제거 (identity)
+- lm_head 직접 복사 (SVD 불필요)
+
 ```
-Input → Qwen(Encoder) → Projection(Bottleneck) → TRM(Reasoner) → Answer
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Training Pipeline                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  Input IDs ──► Qwen Backbone (Frozen) ──► hidden_states [B,S,3584]  │
+│                        │                                             │
+│                        │  (1회 실행, no_grad)                        │
+│                        ▼                                             │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │              Deep Supervision Loop (N_sup = 16)               │   │
+│  │  ┌────────────────────────────────────────────────────────┐  │   │
+│  │  │                                                        │  │   │
+│  │  │  hidden_states ──► x [B,S,3584]  (Identity, no proj)  │  │   │
+│  │  │                      │                                 │  │   │
+│  │  │                      ▼                                 │  │   │
+│  │  │  ┌─────────────────────────────────────────────────┐  │  │   │
+│  │  │  │         Deep Recursion (T = 3)                  │  │  │   │
+│  │  │  │  ┌───────────────────────────────────────────┐ │  │  │   │
+│  │  │  │  │      Latent Recursion (n = 6)             │ │  │  │   │
+│  │  │  │  │  for i in range(n):                       │ │  │  │   │
+│  │  │  │  │      z = TRMBlock(x + y + z)              │ │  │  │   │
+│  │  │  │  │  y = TRMBlock(y + z)                      │ │  │  │   │
+│  │  │  │  └───────────────────────────────────────────┘ │  │  │   │
+│  │  │  │  T-1회: no_grad / 마지막 1회: with grad        │  │  │   │
+│  │  │  └─────────────────────────────────────────────────┘  │  │   │
+│  │  │                      │                                 │  │   │
+│  │  │                      ▼                                 │  │   │
+│  │  │  y ──► TRMHeads (Norm + lm_head) ──► logits [B,S,V]   │  │   │
+│  │  │                      │                                 │  │   │
+│  │  │                      ▼                                 │  │   │
+│  │  │  loss = CrossEntropy(logits, labels)                  │  │   │
+│  │  │  loss.backward() → optimizer.step() → EMA.update()    │  │   │
+│  │  │                      │                                 │  │   │
+│  │  │              y, z detach ──► 다음 step으로             │  │   │
+│  │  │                                                        │  │   │
+│  │  └────────────────────────────────────────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Mini-Qwen 아키텍처 (언어 모델 기능 보존)
+## Architecture Change Summary
 
-### 문제점과 해결책
-
-단순히 TRM을 붙이면 Qwen의 **언어 생성 감각**이 단절됨:
-- 위치 정보(RoPE) 없이 순서 파악 불가
-- Random 초기화된 lm_head로 사전학습 지식 손실
-
-**해결: "Mini-Qwen" 블록으로 TRM 업그레이드**
-
+### Before (Bottleneck Architecture)
 ```
-Before (언어 감각 없음):              After (Qwen 호환):
-┌─────────────────────────┐          ┌─────────────────────────┐
-│ TRM Block               │          │ TRM Block (Mini-Qwen)   │
-│  └─ Attention (RoPE ✗)  │    →     │  └─ RoPE Attention      │ ← 위치 정보
-│  └─ Random lm_head      │          │  └─ head_dim=128        │ ← Qwen 동일
-└─────────────────────────┘          │  └─ Final RMSNorm       │ ← 분포 안정화
-                                     │  └─ SVD lm_head         │ ← 사전학습 활용
-                                     └─────────────────────────┘
+Qwen [3584] → Interface MLP [3584→1024] → TRM [1024] → SVD lm_head [1024→vocab]
 ```
 
-### 핵심 설계 원칙
+### After (Same-Dimension Architecture)
+```
+Qwen [3584] → Identity → TRM [3584] → Qwen lm_head [3584→vocab]
+```
 
-| 항목 | Qwen-2.5-Math-7B | TRM (Mini-Qwen) | 비고 |
-|------|------------------|-----------------|------|
-| head_dim | 128 (3584/28) | **128** (1024/8) | 동일하게 맞춤 |
-| RoPE theta | 1,000,000 | **1,000,000** | 주파수 호환 |
-| Final Norm | RMSNorm | **RMSNorm** | 출력 분포 안정화 |
-| lm_head | Pretrained | **SVD 압축** | 사전학습 활용 |
+### 비교
+
+| 항목 | Before | After |
+|------|--------|-------|
+| TRM dim | 1024 | **3584** |
+| num_heads | 8 | **28** |
+| head_dim | 128 | **128** (동일) |
+| Interface | MLP (3584→1024) | **Identity** |
+| lm_head | SVD 압축 | **Qwen 직접 복사** |
+| TRM Block params | ~21M | **~257M** |
+| 정보 손실 | Bottleneck 압축 | **없음** |
 
 ---
 
-## TRM 3중 루프 구조 (Paper Figure 3, Page 5)
+## Training Data Flow (상세)
 
-**핵심**: 논문의 정확한 3-Level 루프 구조
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Level 1: N_sup = 16 (Deep Supervision)                     │
-│  └─ 매 step마다: backward → opt.step → zero_grad            │
-│     └─ y, z를 detach해서 다음 step으로 전달                  │
-│                                                              │
-│     ┌─────────────────────────────────────────────────┐     │
-│     │  Level 2: T = 3 (Deep Recursion)                │     │
-│     │  └─ T-1번: no_grad로 실행 (메모리 절약)          │     │
-│     │  └─ 1번: grad로 실행 (학습용)                    │     │
-│     │                                                  │     │
-│     │     ┌─────────────────────────────────────┐     │     │
-│     │     │  Level 3: n = 6 (Latent Recursion)  │     │     │
-│     │     │  └─ n번 z 업데이트: z = net(x+y+z)  │     │     │
-│     │     │  └─ 1번 y 업데이트: y = net(y+z)    │     │     │
-│     │     └─────────────────────────────────────┘     │     │
-│     └─────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Effective Depth
-```
-n_layers × (n+1) × T × N_sup = 2 × 7 × 3 × 16 = 672 layers
-```
-
-### 핵심 알고리즘 (Paper Figure 3 + RoPE)
+### Step-by-Step Execution
 
 ```python
-# Level 3: Latent Recursion (engine.py)
-def latent_recursion(x, y, z, cos, sin, n=6):
-    for i in range(n):           # n번 z 업데이트
-        h = x + y + z            # Additive fusion
-        z = block(h, cos, sin)   # RoPE 적용, Direct replacement
-    h = y + z                    # x 완전 제외!
-    y = block(h, cos, sin)       # RoPE 적용
-    return y, z
+# ═══════════════════════════════════════════════════════════════════
+# 1. BACKBONE ENCODING (1회, frozen, no_grad)
+# ═══════════════════════════════════════════════════════════════════
+with torch.no_grad():
+    hidden_states = qwen_backbone(input_ids)  # [B, S, 3584]
 
-# Level 2: Deep Recursion (model.py)
-def deep_recursion(x, y, z, cos, sin, T=3):
-    with torch.no_grad():        # T-1번: 메모리 절약
-        for j in range(T - 1):
+# ═══════════════════════════════════════════════════════════════════
+# 2. DEEP SUPERVISION LOOP (N_sup = 16회)
+# ═══════════════════════════════════════════════════════════════════
+y, z = None, None
+
+for sup_step in range(N_sup):  # 16번 반복
+
+    # ─────────────────────────────────────────────────────────────
+    # 2.1 Context (Identity - no projection)
+    # ─────────────────────────────────────────────────────────────
+    x = hidden_states  # [B, S, 3584] - 그대로 사용
+
+    # 첫 step에서 y, z 초기화
+    if y is None:
+        y = y_init.expand(B, S, -1)  # learnable, 초기값 0
+        z = torch.zeros(B, S, 3584)   # 0으로 초기화
+
+    # ─────────────────────────────────────────────────────────────
+    # 2.2 Deep Recursion (T = 3회)
+    # ─────────────────────────────────────────────────────────────
+    cos, sin = rotary_emb(x, S)  # RoPE 임베딩
+
+    # T-1회: no_grad (메모리 절약)
+    with torch.no_grad():
+        for t in range(T - 1):  # 2회
             y, z = latent_recursion(x, y, z, cos, sin)
-    y, z = latent_recursion(x, y, z, cos, sin)  # 마지막: grad
-    return y.detach(), z.detach()
 
-# Level 1: Deep Supervision (train.py)
-for step in range(N_supervision):  # N_sup = 16
-    (y, z), logits = deep_recursion(x, y, z, cos, sin)
-    loss = cross_entropy(logits, target)
+    # 마지막 1회: with grad (학습용)
+    y, z = latent_recursion(x, y, z, cos, sin)
+
+    # ─────────────────────────────────────────────────────────────
+    # 2.3 Output & Loss
+    # ─────────────────────────────────────────────────────────────
+    logits = trm_heads(y)  # [B, S, vocab_size]
+    loss = cross_entropy(logits, labels)
+
+    # ─────────────────────────────────────────────────────────────
+    # 2.4 Optimization
+    # ─────────────────────────────────────────────────────────────
     loss.backward()
-    opt.step(); opt.zero_grad(); ema.update()
+    clip_grad_norm_(trainable_params, max_norm=1.0)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+    ema.update()
+
+    # ─────────────────────────────────────────────────────────────
+    # 2.5 State Propagation
+    # ─────────────────────────────────────────────────────────────
+    y = y.detach()  # 그래프 절단, 값은 유지
+    z = z.detach()
+```
+
+### Latent Recursion (Level 3) 상세
+
+```python
+def latent_recursion(x, y, z, cos, sin, n=6):
+    """
+    TRM 논문 Figure 3의 핵심 알고리즘
+    - n번 z 업데이트 (reasoning)
+    - 1번 y 업데이트 (prediction)
+    - Direct Replacement (no residual!)
+    """
+    # n번 z 업데이트 (Reasoning Mode)
+    for i in range(n):  # 6회
+        h = x + y + z           # Additive fusion
+        z = trm_block(h, cos, sin)  # Direct replacement
+
+    # 1번 y 업데이트 (Prediction Mode)
+    h = y + z                   # x 완전 제외!
+    y = trm_block(h, cos, sin)  # Direct replacement
+
+    return y, z
 ```
 
 ---
 
 ## Module Specifications
 
-### 1. Semantic Encoder (Qwen-2.5-Math-7B)
+### 1. Qwen Backbone (Frozen)
 
 | Hyperparameter | Value | 비고 |
 |----------------|-------|------|
+| Model | Qwen2.5-Math-7B-Instruct | 수학 특화 |
 | Parameters | ~7.61B | Non-embedding: ~6.53B |
-| **Hidden Size** | **3584** | 일반 7B(4096)와 다름 - 주의! |
-| Intermediate | 18,944 | SwiGLU FFN |
+| **Hidden Size** | **3584** | TRM도 동일! |
 | Layers | 28 | Transformer depth |
-| Q Heads | 28 | Query heads |
-| KV Heads | **4** | GQA 7:1 비율 |
+| Attention | GQA (28 Q, 4 KV) | 7:1 비율 |
 | **head_dim** | **128** | 3584/28 |
-| Vocab Size | 151,936 | Byte-level BPE |
 | **RoPE theta** | **1,000,000** | 위치 임베딩 주파수 |
+| Vocab Size | 151,936 | Byte-level BPE |
 
-### 2. TRM Interface (Projection Layer)
+### 2. TRM Interface (Simplified)
 
 ```
-Qwen Output [B, S, 3584] → Linear + RMSNorm → TRM Input [B, S, 1024]
+┌─────────────────────────────────────────────────────────────┐
+│  Interface (Identity)                                        │
+├─────────────────────────────────────────────────────────────┤
+│  extract_context(hidden_states) → hidden_states             │
+│  (No projection, same dimension)                             │
+│                                                              │
+│  y_init: learnable [1, 1, 3584], initialized to zeros       │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-- **Information Bottleneck**: 3584 → 1024 차원 압축
+- **역할**: State 초기화만 담당
+- **파라미터**: ~3.5K (y_init only)
 
 ### 3. State Variables
 
-| State | Shape | 역할 |
-|-------|-------|------|
-| **x** (Context) | [B, S, 1024] | 문제의 불변 의미 표현 (Anchor, Frozen) |
-| **y** (Solution) | [B, S, 1024] | 현재 잠정 정답 임베딩 |
-| **z** (Reasoning) | [B, S, 1024] | 추론 궤적 (Hidden Reasoning Path) |
+| State | Shape | 역할 | 초기화 |
+|-------|-------|------|--------|
+| **x** | [B, S, 3584] | Context (Anchor) | hidden_states 그대로 |
+| **y** | [B, S, 3584] | Solution (Answer) | learnable y_init (zeros) |
+| **z** | [B, S, 3584] | Reasoning (Thought) | zeros |
 
-### 4. TRM Block (Mini-Qwen 구조)
+### 4. TRM Block (Trainable) - Qwen과 동일 구조
 
-**Qwen 호환 설계:**
-
-| 항목 | 설명 |
-|------|------|
-| **RoPE Attention** | `apply_rotary_pos_emb(q, k, cos, sin)` - 위치 정보 유지 |
-| **head_dim=128** | Qwen과 동일 → RoPE 주파수 호환 |
-| **SwiGLU FFN** | Qwen과 동일한 활성화 함수 |
-| **RMSNorm** | Pre-LN 구조 |
-
-```python
-class TRMBlock:
-    def forward(self, h, cos, sin):
-        # TRM uses DIRECT REPLACEMENT (no residual!)
-        # This is different from standard Transformers
-        h_attn = attn(norm1(h), cos, sin)  # RoPE 적용
-        out = mlp(norm2(h_attn))           # SwiGLU
-        return out  # NO residual connection
+```
+┌─────────────────────────────────────────────────────────────┐
+│  TRMBlock (Qwen-Compatible Architecture)                     │
+├─────────────────────────────────────────────────────────────┤
+│  Input h [B, S, 3584]                                        │
+│       ↓                                                      │
+│  RMSNorm(3584)                                               │
+│       ↓                                                      │
+│  TRMAttention (28 heads, head_dim=128)                       │
+│    - Q, K, V projections                                     │
+│    - RoPE: apply_rotary_pos_emb(q, k, cos, sin)             │
+│    - Scaled Dot-Product Attention (Flash Attention)          │
+│    - Output projection (Zero Init)                           │
+│       ↓                                                      │
+│  RMSNorm(3584)                                               │
+│       ↓                                                      │
+│  SwiGLU FFN (3584 → 14336 → 3584)                           │
+│    - gate_proj, up_proj, down_proj (Zero Init)               │
+│       ↓                                                      │
+│  Output [B, S, 3584]  ← NO RESIDUAL CONNECTION!             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Zero Init**: Output projections (o_proj, down_proj)를 0으로 초기화하여
-초기 출력이 0이 되도록 함. 이로써 학습 시작 시 안정성 확보.
+**핵심 설계:**
+- **Direct Replacement**: `out = block(h)` (not `out = h + block(h)`)
+- **Zero Init**: o_proj, down_proj를 0으로 초기화 → 초기 출력 = 0
+- **Qwen 호환**: head_dim=128, num_heads=28, theta=1e6
+- **파라미터**: ~257M (3.5x larger than before)
 
-### 5. TRM Heads (Qwen 가중치 활용)
+### 5. TRM Heads (Trainable)
 
-**핵심: SVD 압축으로 사전학습 지식 보존**
-
-```python
-class TRMHeads:
-    def __init__(self, config, qwen_lm_head):
-        self.norm = RMSNorm(1024)           # Final Norm (출력 안정화)
-        self.lm_head = Linear(1024, vocab)  # SVD 초기화
-
-    def _init_from_qwen(self, qwen_lm_head):
-        # Qwen [vocab, 3584] → SVD → TRM [vocab, 1024]
-        U, S, V = svd_lowrank(qwen_lm_head.weight, q=1024)
-        self.lm_head.weight = U @ diag(S)
+```
+┌─────────────────────────────────────────────────────────────┐
+│  TRMHeads                                                    │
+├─────────────────────────────────────────────────────────────┤
+│  Input y [B, S, 3584]                                        │
+│       ↓                                                      │
+│  RMSNorm(3584)        ← 출력 분포 안정화                      │
+│       ↓                                                      │
+│  lm_head Linear(3584, 151936)  ← Qwen 가중치 직접 복사       │
+│       ↓                                                      │
+│  Output logits [B, S, 151936]                                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 6. Training Strategy
-
-- **Deep Supervision**: N_sup=16번, 매 step backward
-- **Truncated BPTT**: y, z detach로 그래프 절단
-- **EMA**: decay=0.999 (학습 안정성)
-- **AdamW**: β1=0.9, β2=0.95
+**lm_head 초기화 (SVD 불필요!):**
+```python
+# Same dimension → direct copy
+trm_lm_head.weight.copy_(qwen_lm_head.weight)
+```
+- **파라미터**: ~545M (vocab × 3584)
 
 ---
 
-## Implementation Status
+## Training Configuration
 
-### Phase 1: Foundation ✅
-- [x] Qwen-2.5-Math-7B 로딩 및 Freeze
-- [x] TRMInterface 구현 (3584 → 1024 Projection)
-- [x] State 초기화 로직 (x, y, z)
+### 3-Level Loop Parameters
 
-### Phase 2: TRM Engine ✅
-- [x] RotaryEmbedding (theta=1e6, head_dim=128)
-- [x] TRMAttention with RoPE (Qwen 호환)
-- [x] TRMBlock 구현 (Additive Fusion + RoPE)
-- [x] TinyRecursiveTransformer - Latent Recursion
+| Level | Parameter | Value | 역할 |
+|-------|-----------|-------|------|
+| Level 1 | N_supervision | 16 | Deep Supervision steps |
+| Level 2 | T_recursion | 3 | Deep Recursion (T-1 no_grad + 1 grad) |
+| Level 3 | n_latent | 6 | Latent Recursion (z updates) |
 
-### Phase 3: Training Loop ✅
-- [x] TRMHeads (Final Norm + SVD lm_head 초기화)
-- [x] QwenTRM - Deep Recursion (T-1 no_grad + 1 grad)
-- [x] Trainer - Deep Supervision (N_sup 루프)
-- [x] EMA 구현 및 적용
-- [x] Zero Init for stable training start
-- [x] Direct replacement (no residual) per TRM paper
+### Effective Depth
+```
+Depth = n_layers × (n + 1) × T × N_sup
+      = 2 × 7 × 3 × 16
+      = 672 effective layers
+```
 
-### Phase 4: Evaluation Infrastructure ✅
-- [x] GSM8K evaluation script (`eval/gsm8k_eval.py`)
-- [x] Qwen Zero-shot baseline: **93.71%** on GSM8K
-- [x] TRM Identity Test passed (Zero Init 검증)
+### Optimizer Settings
 
-### Phase 5: Training Scripts ✅
-- [x] `train_trm.py` - TRM training with Deep Supervision
-- [x] `train_finetune.py` - Last N layers finetuning (baseline)
-- [x] `train_lora.py` - LoRA training (alternative baseline)
+| Parameter | Value |
+|-----------|-------|
+| Optimizer | AdamW |
+| Learning Rate | 1e-4 |
+| β1, β2 | 0.9, 0.95 |
+| Weight Decay | 0.01 |
+| Gradient Clipping | 1.0 |
+| LR Scheduler | CosineAnnealing |
+| EMA Decay | 0.999 |
 
-### Phase 6: Experiments (IN PROGRESS)
-- [x] TRM training on GSM8K started (Loss 7.08 → 2.57)
-- [ ] Complete TRM training and evaluate
-- [ ] Train finetune baseline for comparison
-- [ ] Dynamic T inference test
+### Scheduler 계산 (중요!)
 
-### Phase 7: Kaggle Submission (TODO)
-- [ ] Dynamic Depth Inference optimization
-- [ ] Kaggle Submission Format 호환
-- [ ] 5시간 GPU 제한 내 최적화
+```python
+# N_sup을 고려한 total_steps 계산
+total_optimizer_steps = num_batches × num_epochs × N_supervision
+                      = 1868 × 3 × 16
+                      = 89,664 steps
+
+scheduler = CosineAnnealingLR(optimizer, T_max=89664)
+```
+
+### Gradient Accumulation (Step-wise State Offloading)
+
+TRM의 Deep Supervision 구조에서는 일반적인 gradient accumulation이 불가능합니다.
+대신 **Step-wise State Offloading** 방식을 사용합니다:
+
+```python
+# 알고리즘 핵심
+for sup_step in range(N_sup):  # 16
+    optimizer.zero_grad()
+
+    for micro_batch in micro_batches:  # accumulation_steps
+        # CPU에서 y, z 상태 로드 → GPU
+        y, z = load_states_from_cpu(micro_batch_idx)
+
+        loss = forward(hidden_states, y, z) / acc_steps
+        loss.backward()  # gradient 누적
+
+        # GPU에서 y, z 상태 저장 → CPU
+        save_states_to_cpu(y, z, micro_batch_idx)
+
+    optimizer.step()  # step 끝에서 1번만 update
+```
+
+**핵심 원리:**
+- 같은 supervision step 내 모든 micro-batch가 **동일한 가중치**로 forward
+- Gradient를 누적한 후 step 끝에서 **1번만 update**
+- 다음 step에서는 **업데이트된 가중치** 사용
+- y, z 상태는 CPU에 offload하여 GPU 메모리 절약
+
+**사용법:**
+```bash
+# Effective batch = 4 * 4 = 16
+python train_trm.py --batch_size 4 --gradient_accumulation 4
+```
+
+---
+
+## Parameter Count
+
+| Component | Parameters | Trainable |
+|-----------|------------|-----------|
+| Qwen Backbone | ~7.61B | ❌ Frozen |
+| Interface | ~3.5K | ✅ (y_init only) |
+| TRM Block | ~257M | ✅ |
+| TRM Heads | ~545M | ✅ |
+| **Total Trainable** | **~802M** | |
+
+**Note**: 이전 구조(~177M) 대비 ~4.5x 증가. 메모리 요구량 증가하지만 정보 손실 없음.
 
 ---
 
@@ -255,87 +382,103 @@ class TRMHeads:
 
 ```
 MathLLM/
-├── CLAUDE.md                    # 프로젝트 컨텍스트 (이 파일)
+├── CLAUDE.md                    # 프로젝트 문서 (이 파일)
 ├── TRM.pdf                      # TRM 논문 원문
-├── main.py                      # 메인 실행 스크립트
 ├── train_trm.py                 # TRM 학습 스크립트
-├── train_finetune.py            # Last N layers finetuning
-├── train_lora.py                # LoRA 학습 스크립트
+├── train_finetune.py            # Finetuning baseline
+├── train_lora.py                # LoRA baseline
 ├── src/
-│   ├── config.py      # TRMConfig (RoPE 설정 포함)
-│   ├── interface.py   # TRMInterface (Backbone → TRM projection)
-│   ├── layers.py      # RotaryEmbedding, TRMBlock (RoPE Attention, Zero Init)
-│   ├── engine.py      # TinyRecursiveTransformer (cos/sin 전달)
-│   ├── model.py       # QwenTRM (RoPE 초기화, lm_head 연동)
-│   ├── heads.py       # TRMHeads (Final Norm + SVD 초기화)
-│   ├── train.py       # Trainer + EMA
-│   └── dataset.py     # GSM8K Dataset
+│   ├── config.py                # TRMConfig (d_lat=3584, num_heads=28)
+│   ├── interface.py             # TRMInterface (Identity, y_init only)
+│   ├── layers.py                # RotaryEmbedding, TRMBlock, TRMAttention
+│   ├── engine.py                # TinyRecursiveTransformer (Latent Recursion)
+│   ├── model.py                 # QwenTRM (Deep Recursion + encode_backbone)
+│   ├── heads.py                 # TRMHeads (Direct copy from Qwen)
+│   ├── train.py                 # Trainer (Deep Supervision Loop)
+│   └── dataset.py               # GSM8K Dataset
 ├── eval/
-│   ├── gsm8k_eval.py  # GSM8K 평가 스크립트
-│   └── utils.py       # 평가 유틸리티
-└── checkpoints/                 # 학습된 모델 저장
+│   └── gsm8k_eval.py            # GSM8K 평가
+└── checkpoints/                 # 모델 저장
 ```
 
 ---
 
-## Key Hyperparameters (config.py)
+## Key Implementation Details
+
+### 1. Same Dimension Architecture (NEW!)
 
 ```python
-@dataclass
-class TRMConfig:
-    backbone_dim: int = 3584      # Qwen hidden size
-    d_lat: int = 1024             # TRM latent dimension
-    num_heads: int = 8            # 1024/8 = 128 head_dim (Qwen 동일)
-    expansion: int = 4
-
-    # RoPE settings (Qwen 호환)
-    rope_theta: float = 1000000.0
-    max_position_embeddings: int = 32768
-
-    # 3-Level Loop Parameters
-    n_latent: int = 6             # Level 3: Latent Recursion
-    T_recursion: int = 3          # Level 2: Deep Recursion
-    N_supervision: int = 16       # Level 1: Deep Supervision
-
-    vocab_size: int = 151936
-    use_ema: bool = True
-    ema_decay: float = 0.999
+# TRMConfig
+d_lat: int = 3584         # Same as Qwen!
+num_heads: int = 28       # Same as Qwen!
+head_dim: int = 128       # 3584/28 = 128
 ```
+
+**장점:**
+- No information bottleneck
+- Qwen lm_head 직접 사용 (사전학습 지식 100% 활용)
+- RoPE 완벽 호환
+
+### 2. Direct Replacement (No Residual)
+
+```python
+# Standard Transformer (residual)
+out = h + attention(norm(h))
+out = out + ffn(norm(out))
+
+# TRM Block (direct replacement)
+out = attention(norm(h))
+out = ffn(norm(out))  # h가 더해지지 않음!
+```
+
+**이유**: Zero Init과 결합하여 초기 안정성 확보
+
+### 3. Zero Initialization
+
+```python
+# TRMBlock.__init__
+nn.init.zeros_(self.attn.o_proj.weight)
+nn.init.zeros_(self.mlp.down_proj.weight)
+```
+
+**효과**: 학습 시작 시 `block(h) ≈ 0` → 값 폭발 방지
+
+### 4. RoPE Full Compatibility
+
+```python
+# TRM과 Qwen 완전 동일
+head_dim = 3584 / 28 = 128
+rope_theta = 1_000_000
+```
+
+**효과**: Qwen의 위치 인코딩 패턴을 그대로 활용
+
+### 5. 속도 최적화
+
+- **RoPE 캐싱**: batch당 1회만 계산, supervision steps간 재사용
+- **Gradient clipping 최적화**: trainable params 리스트 캐싱
+- **non_blocking transfer**: CPU↔GPU 전송 시 `non_blocking=True`로 비동기 처리
+- **torch.compile**: `--compile` 옵션으로 TRM engine 컴파일 가능
 
 ---
 
 ## Critical Notes
 
-### Dimension Mismatch Warning
-> Qwen-2.5-Math-7B의 Hidden Size는 **3584**이다 (일반 7B 모델의 4096이 아님).
+### TRM은 이제 Qwen과 동일 차원
+> `d_lat = backbone_dim = 3584`로 설정됨.
+> Interface는 identity function이 됨.
 
-### head_dim 일치 중요
-> TRM의 `num_heads=8` (1024/8=128)은 Qwen의 `head_dim=128`과 동일.
-> 이로 인해 Qwen의 RoPE 주파수 설정을 그대로 활용 가능.
+### lm_head는 직접 복사
+> SVD 압축 불필요. Qwen의 lm_head 가중치를 그대로 복사.
+> 사전학습 지식 손실 없음.
 
-### lm_head SVD 초기화
-> Qwen의 사전학습된 lm_head [vocab, 3584]를 SVD로 압축하여 [vocab, 1024]로 초기화.
-> Random init 대비 학습 초기 수렴 속도 크게 향상.
+### 메모리 증가
+> TRM Block이 ~257M (이전 ~21M 대비 12x)
+> 전체 trainable params ~802M (이전 ~177M 대비 4.5x)
 
-### 논문 vs Gemini Spec 주의
-> `TRM_PAPER_VS_GEMINI_SPEC.md` 참조. Gemini가 생성한 Part1/2/3.txt는 논문과 다름.
-> 현재 구현은 **논문 Figure 3 기준** + **Qwen 호환 업그레이드**.
-
-### Memory Considerations
-- T-1번은 no_grad로 메모리 절약
-- 매 supervision step마다 y, z detach
-- Effective depth 672 layers이지만 메모리는 최소화
-
-### Zero Init + Direct Replacement (핵심!)
-> TRM의 TRMBlock은 **residual connection이 없다** (standard Transformer와 다름).
-> `out = mlp(norm2(attn(norm1(h))))` - 입력 h가 출력에 더해지지 않음.
->
-> Zero Init과 함께: 학습 초기에 block output = 0이 되어 안정적인 시작점 제공.
-> 재귀 루프에서 값이 폭발하지 않음 (y,z = 0으로 시작 → 점진적 학습).
-
-### State Initialization
-- **y**: learnable parameter `y_init` (초기값 0)
-- **z**: `torch.zeros(...)` (x가 아닌 0으로 초기화 - 값 폭발 방지)
+### Scheduler는 N_sup 고려 필수
+> `total_steps = batches × epochs × N_supervision`
+> N_sup을 빼먹으면 LR이 16배 빠르게 decay됨.
 
 ---
 

@@ -1,6 +1,7 @@
 """
 Part 1: TRM Interface
-Qwen (3584) → Projection (1024) → TRM States (x, y, z)
+Now simplified: Qwen hidden_states → TRM directly (same dimension)
+No projection needed since d_lat = backbone_dim = 3584
 """
 
 from typing import Tuple, Optional
@@ -13,8 +14,9 @@ from .config import TRMConfig
 
 class TRMInterface(nn.Module):
     """
-    Bridge between frozen Qwen backbone and trainable TRM engine.
-    Handles dimensionality reduction (Information Bottleneck).
+    Simplified interface: No projection needed.
+    TRM now operates at the same dimension as Qwen (3584).
+    Only handles state initialization.
     """
 
     def __init__(self, config: Optional[TRMConfig] = None, **kwargs):
@@ -22,48 +24,32 @@ class TRMInterface(nn.Module):
 
         # Support both config object and direct kwargs
         if config is not None:
-            backbone_dim = config.backbone_dim
             trm_dim = config.d_lat
-            eps = config.eps
         else:
-            backbone_dim = kwargs.get('backbone_dim', 3584)
-            trm_dim = kwargs.get('trm_dim', 1024)
-            eps = kwargs.get('eps', 1e-6)
+            trm_dim = kwargs.get('trm_dim', 3584)
 
-        self.backbone_dim = backbone_dim
         self.trm_dim = trm_dim
-
-        # Projection Layer (The Bottleneck) - upgraded to MLP to reduce information loss
-        # 3584 -> (2 * d_lat) -> d_lat with non-linearity
-        hidden_dim = trm_dim * 2
-        self.projector = nn.Sequential(
-            nn.Linear(backbone_dim, hidden_dim, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden_dim, trm_dim, bias=False),
-            nn.RMSNorm(trm_dim, eps=eps),
-        )
 
         # Learnable initial states
         self.y_init = nn.Parameter(torch.zeros(1, 1, trm_dim))
 
     def extract_context(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        Project Qwen hidden states to TRM latent space.
+        Identity function - no projection needed.
 
         Args:
             hidden_states: [Batch, Seq, 3584] from Qwen
         Returns:
-            x: [Batch, Seq, 1024] context for TRM
+            x: [Batch, Seq, 3584] context for TRM (same tensor)
         """
-        # Ensure dtype consistency (backbone may output bfloat16)
-        return self.projector(hidden_states.to(self.projector[0].weight.dtype))
+        return hidden_states
 
     def initialize_states(self, x: torch.Tensor):
         """
         Initialize y and z based on context x.
 
         Args:
-            x: [Batch, Seq, D] projected context
+            x: [Batch, Seq, D] context (D=3584)
         Returns:
             y: [Batch, Seq, D] initial solution state (zeros)
             z: [Batch, Seq, D] initial reasoning state (zeros)
@@ -78,14 +64,6 @@ class TRMInterface(nn.Module):
         y = self.y_init.expand(batch_size, seq_len, -1).clone()
 
         # z: starts as zeros (not x!) to prevent value explosion
-        # With Zero Init, first iteration: h = x + 0 + 0 = x, z = block(x) ≈ x
         z = torch.zeros(batch_size, seq_len, d, device=x.device, dtype=x.dtype)
 
         return y, z
-
-    def _init_weights(self, module: nn.Module):
-        """Xavier initialization for linear layers"""
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
