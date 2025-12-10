@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
 
 from .config import TRMConfig
 from .model import QwenTRM
@@ -45,6 +46,10 @@ class TrainingConfig:
 
     # Logging
     log_steps: int = 10
+
+    # Mixed Precision (AMP)
+    use_amp: bool = True
+    amp_dtype: str = "bfloat16"  # "bfloat16" or "float16"
 
 
 class EMA:
@@ -146,6 +151,18 @@ class Trainer:
         # Device
         self.device = next(model.parameters()).device
 
+        # Mixed Precision (AMP)
+        self.use_amp = self.config.use_amp
+        if self.use_amp:
+            self.amp_dtype = torch.bfloat16 if self.config.amp_dtype == "bfloat16" else torch.float16
+            # bfloat16 doesn't need GradScaler, float16 does
+            self.scaler = torch.amp.GradScaler('cuda') if self.config.amp_dtype == "float16" else None
+            print(f"[Trainer] AMP enabled with {self.config.amp_dtype}")
+        else:
+            self.amp_dtype = torch.float32
+            self.scaler = None
+            print("[Trainer] AMP disabled, using float32")
+
     def _setup_optimizer(self) -> AdamW:
         """Setup AdamW optimizer for TRM parameters only (Paper: β1=0.9, β2=0.95)"""
         # Only optimize non-backbone parameters
@@ -187,21 +204,35 @@ class Trainer:
         """
         self.model.train()
         acc_steps = self.config.gradient_accumulation_steps
+        total_batches = len(self.train_dataloader)
 
         for epoch in range(self.config.num_epochs):
             self.epoch = epoch
             epoch_loss = 0.0
             num_updates = 0
 
+            # Progress bar for epoch
+            pbar = tqdm(
+                self.train_dataloader,
+                desc=f"Epoch {epoch + 1}/{self.config.num_epochs}",
+                unit="batch",
+                dynamic_ncols=True
+            )
+
             # Fast path: no accumulation (no CPU offloading)
             if acc_steps == 1:
-                for batch_idx, batch in enumerate(self.train_dataloader):
+                for batch_idx, batch in enumerate(pbar):
                     loss = self._training_step(batch)
                     epoch_loss += loss
                     num_updates += 1
 
-                    if self.global_step % self.config.log_steps == 0:
-                        self._log_step(loss)
+                    # Update progress bar
+                    lr = self.scheduler.get_last_lr()[0]
+                    pbar.set_postfix({
+                        'loss': f'{loss:.4f}',
+                        'lr': f'{lr:.2e}',
+                        'step': self.global_step
+                    })
 
                     if self.eval_dataloader and self.global_step % self.config.eval_steps == 0:
                         self._evaluate()
@@ -214,7 +245,7 @@ class Trainer:
                 # Slow path: gradient accumulation with CPU offloading
                 micro_batches = []
 
-                for batch_idx, batch in enumerate(self.train_dataloader):
+                for batch_idx, batch in enumerate(pbar):
                     micro_batches.append(batch)
 
                     if len(micro_batches) == acc_steps:
@@ -223,8 +254,13 @@ class Trainer:
                         num_updates += 1
                         micro_batches = []
 
-                        if self.global_step % self.config.log_steps == 0:
-                            self._log_step(loss)
+                        # Update progress bar
+                        lr = self.scheduler.get_last_lr()[0]
+                        pbar.set_postfix({
+                            'loss': f'{loss:.4f}',
+                            'lr': f'{lr:.2e}',
+                            'step': self.global_step
+                        })
 
                         if self.eval_dataloader and self.global_step % self.config.eval_steps == 0:
                             self._evaluate()
@@ -241,8 +277,14 @@ class Trainer:
                     num_updates += 1
                     self.global_step += 1
 
+            pbar.close()
+
             avg_loss = epoch_loss / max(num_updates, 1)
             print(f"Epoch {epoch + 1}/{self.config.num_epochs} - Avg Loss: {avg_loss:.4f}")
+
+        # Save final checkpoint after training completes
+        print(f"[Train] Training complete. Saving final checkpoint...")
+        self._save_checkpoint()
 
     def _training_step_accumulated(self, micro_batches: list) -> float:
         """
@@ -311,33 +353,41 @@ class Trainer:
                 y = all_y[i].to(self.device, non_blocking=True) if all_y[i] is not None else None
                 z = all_z[i].to(self.device, non_blocking=True) if all_z[i] is not None else None
 
-                # Forward
-                outputs = self.model(
-                    labels=labels,
-                    y=y,
-                    z=z,
-                    hidden_states=hidden_states,
-                    cos=cos,
-                    sin=sin
-                )
+                # Forward with AMP
+                with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                    outputs = self.model(
+                        labels=labels,
+                        y=y,
+                        z=z,
+                        hidden_states=hidden_states,
+                        cos=cos,
+                        sin=sin
+                    )
+                    # Scale loss for accumulation
+                    loss = outputs['loss'] / acc_steps
 
-                # Scale loss for accumulation
-                loss = outputs['loss'] / acc_steps
                 step_loss += outputs['loss'].item()  # Log unscaled loss
 
-                # Backward (accumulates gradients)
-                loss.backward()
+                # Backward (accumulates gradients) with optional GradScaler
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
                 # Save states to CPU for next supervision step (non_blocking)
                 all_y[i] = outputs['y'].to('cpu', non_blocking=True)
                 all_z[i] = outputs['z'].to('cpu', non_blocking=True)
 
             # 3b. Update weights after all micro-batches processed
-            torch.nn.utils.clip_grad_norm_(
-                self.trm_params,
-                self.config.max_grad_norm
-            )
-            self.optimizer.step()
+            if self.scaler is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.trm_params, self.config.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(self.trm_params, self.config.max_grad_norm)
+                self.optimizer.step()
+
             self.scheduler.step()
 
             # EMA update
@@ -353,6 +403,7 @@ class Trainer:
         """
         Single batch training step (no accumulation).
         Fast path without CPU offloading.
+        Supports mixed precision (AMP) for faster training.
         """
         # Move batch to device
         input_ids = batch['input_ids'].to(self.device)
@@ -379,26 +430,32 @@ class Trainer:
         for sup_step in range(N_sup):
             self.optimizer.zero_grad()
 
-            outputs = self.model(
-                labels=labels,
-                y=y,
-                z=z,
-                hidden_states=hidden_states,
-                cos=cos,
-                sin=sin
-            )
+            # Forward with AMP
+            with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+                outputs = self.model(
+                    labels=labels,
+                    y=y,
+                    z=z,
+                    hidden_states=hidden_states,
+                    cos=cos,
+                    sin=sin
+                )
+                loss = outputs['loss']
 
-            loss = outputs['loss']
             total_loss += loss.item()
 
-            loss.backward()
+            # Backward with optional GradScaler (for float16)
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.trm_params, self.config.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.trm_params, self.config.max_grad_norm)
+                self.optimizer.step()
 
-            torch.nn.utils.clip_grad_norm_(
-                self.trm_params,
-                self.config.max_grad_norm
-            )
-
-            self.optimizer.step()
             self.scheduler.step()
 
             if self.ema is not None:
@@ -431,10 +488,18 @@ class Trainer:
                 # Encode backbone once, reuse hidden_states
                 hidden_states = self.model.encode_backbone(input_ids, attention_mask)
 
+                # Compute RoPE once and reuse across supervision steps
+                B, S, D = hidden_states.shape
+                cos, sin = self.model.rotary_emb(hidden_states, S)
+
                 # Run full N_sup supervision for evaluation
                 y, z = None, None
                 for _ in range(self.model_config.N_supervision):
-                    outputs = self.model(labels=labels, y=y, z=z, hidden_states=hidden_states)
+                    outputs = self.model(
+                        labels=labels, y=y, z=z,
+                        hidden_states=hidden_states,
+                        cos=cos, sin=sin
+                    )
                     y = outputs['y']
                     z = outputs['z']
 

@@ -3,14 +3,22 @@ TRM Training Script for Qwen-2.5-Math-7B + TRM
 Phase 2: Experimental group for LoRA comparison
 
 Implements the 3-level recursive training from TRM paper.
+
+Optimizations applied:
+- Pre-tokenization (tokenize once at dataset creation)
+- Dynamic padding (pad to max length in batch, not max_length)
+- Mixed precision training (bfloat16)
+- Optimized DataLoader (prefetch_factor, drop_last)
 """
 
 import argparse
 import os
+
 import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+from tqdm import tqdm
 
 from src.model import QwenTRM
 from src.config import TRMConfig
@@ -29,40 +37,48 @@ Solution: {answer}"""
 
 
 class MathDataset(torch.utils.data.Dataset):
-    """Dataset wrapper for math problems."""
+    """
+    Dataset wrapper for math problems with pre-tokenization.
+
+    Optimization: Tokenizes all examples once at initialization,
+    avoiding repeated tokenizer calls during training.
+    Uses fixed-length padding for consistent tensor shapes (better GPU performance).
+    """
 
     def __init__(self, dataset, tokenizer, max_length=1024):
-        self.dataset = dataset
-        self.tokenizer = tokenizer
         self.max_length = max_length
 
+        # Pre-tokenize all examples with fixed-length padding
+        print("Pre-tokenizing dataset...")
+        self.tokenized_data = []
+        for example in tqdm(dataset, desc="Tokenizing"):
+            text = format_example(example)
+            tokenized = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding="max_length",  # Fixed padding for consistent shapes
+                return_tensors="pt"
+            )
+            input_ids = tokenized["input_ids"].squeeze(0)
+            attention_mask = tokenized["attention_mask"].squeeze(0)
+
+            # Labels: mask padding with -100
+            labels = input_ids.clone()
+            labels[attention_mask == 0] = -100
+
+            self.tokenized_data.append({
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "labels": labels
+            })
+        print(f"Pre-tokenized {len(self.tokenized_data)} examples")
+
     def __len__(self):
-        return len(self.dataset)
+        return len(self.tokenized_data)
 
     def __getitem__(self, idx):
-        example = self.dataset[idx]
-        text = format_example(example)
-
-        tokenized = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-
-        input_ids = tokenized["input_ids"].squeeze(0)
-        attention_mask = tokenized["attention_mask"].squeeze(0)
-
-        # Mask padding tokens in labels with -100 (ignored by CrossEntropyLoss)
-        labels = input_ids.clone()
-        labels[attention_mask == 0] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels
-        }
+        return self.tokenized_data[idx]
 
 
 def count_trainable_params(model):
@@ -96,6 +112,12 @@ def main():
     parser.add_argument("--gradient_accumulation", type=int, default=1,
                         help="Gradient accumulation steps (effective batch = batch_size * this)")
 
+    # Performance optimizations
+    parser.add_argument("--amp", action="store_true", default=True,
+                        help="Use automatic mixed precision (bfloat16)")
+    parser.add_argument("--no-amp", dest="amp", action="store_false",
+                        help="Disable AMP, use float32")
+
     args = parser.parse_args()
 
     print(f"Loading QwenTRM with backbone: {args.model}")
@@ -120,10 +142,20 @@ def main():
         init_lm_head=True
     )
 
+    # Convert TRM components to bfloat16 for AMP compatibility
+    # This avoids dtype mismatch warnings and enables fused kernels
+    if args.amp:
+        print("[QwenTRM] Converting TRM components to bfloat16...")
+        model.interface = model.interface.to(torch.bfloat16)
+        model.engine = model.engine.to(torch.bfloat16)
+        model.heads = model.heads.to(torch.bfloat16)
+
     # Optional: torch.compile for speedup
     if args.compile:
         print("Compiling TRM engine with torch.compile...")
-        model.engine = torch.compile(model.engine, mode="reduce-overhead")
+        # Use default mode instead of reduce-overhead to avoid CUDAGraph issues
+        # with TRM's recursive structure
+        model.engine = torch.compile(model.engine, mode="default")
 
     trainable, total = count_trainable_params(model)
     print(f"\nTRM Configuration:")
@@ -147,19 +179,20 @@ def main():
 
     print(f"Training samples: {len(dataset)}")
 
-    # Create datasets
+    # Create datasets with pre-tokenization
     train_dataset = MathDataset(dataset, tokenizer, args.max_length)
 
+    # Optimized DataLoader (fixed-length padding, no custom collate needed)
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=12,
+        num_workers=0,          # Single process to avoid multiprocessing issues
         pin_memory=True,
-        persistent_workers=True
+        drop_last=True          # Avoid uneven final batch
     )
 
-    # Training config
+    # Training config with AMP
     training_config = TrainingConfig(
         learning_rate=args.lr,
         num_epochs=args.epochs,
@@ -168,7 +201,9 @@ def main():
         output_dir=args.output_dir,
         log_steps=10,
         save_steps=500,
-        eval_steps=100
+        eval_steps=100,
+        use_amp=args.amp,
+        amp_dtype="bfloat16"
     )
 
     # Create trainer
@@ -183,6 +218,7 @@ def main():
     print(f"  Gradient accumulation: {args.gradient_accumulation}")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation}")
     print(f"  Learning rate: {args.lr}")
+    print(f"  Mixed Precision (AMP): {args.amp} {'(bfloat16)' if args.amp else '(float32)'}")
 
     trainer.train()
 

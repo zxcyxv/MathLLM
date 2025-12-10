@@ -460,6 +460,41 @@ rope_theta = 1_000_000
 - **non_blocking transfer**: CPU↔GPU 전송 시 `non_blocking=True`로 비동기 처리
 - **torch.compile**: `--compile` 옵션으로 TRM engine 컴파일 가능
 
+### 6. Inference KV Cache (NEW!)
+
+TRM의 추론 속도를 대폭 개선하는 KV Cache 구현:
+
+```
+Before (느림):
+- 토큰 512개 생성 시: 512 × 16 × 전체시퀀스 처리
+- 매 토큰마다 과거 전체를 다시 계산 → O(S³)
+
+After (빠름):
+- Prefill: 전체 prompt 1회 × 16 supervision → KV cache 저장
+- Decode: 새 토큰 1개만 × 16 supervision, 과거는 KV cache 참조
+- O(S) per token
+```
+
+**구현 핵심:**
+```python
+# TRMAttention with KV cache
+def forward(self, x, cos, sin, past_kv=None, use_cache=False, attention_mask=None):
+    # Q: 현재 토큰에서 계산 (변함)
+    # K, V: past_kv에서 가져옴 (고정) + 현재 토큰
+    if past_kv is not None:
+        k = torch.cat([past_k, k], dim=2)
+        v = torch.cat([past_v, v], dim=2)
+```
+
+**Virtual Layers:**
+- TRM engine은 n+1번 block 호출 (n번 z update + 1번 y update)
+- 각 호출을 "virtual layer"로 취급하여 별도 KV cache 유지
+- `past_kvs`: List of (k, v) for n+1 virtual layers
+
+**attention_mask 전파:**
+- Batch > 1에서 패딩 처리를 위해 attention_mask 지원
+- layers → engine → model.generate()까지 전파
+
 ---
 
 ## Critical Notes

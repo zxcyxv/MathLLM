@@ -38,11 +38,18 @@ class RotaryEmbedding(nn.Module):
     def forward(self, x: torch.Tensor, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
         if seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len)
+
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+
+        # Only convert dtype if necessary (avoid unnecessary conversion)
+        target_dtype = x.dtype if x is not None else cos.dtype
+        if cos.dtype != target_dtype:
+            cos = cos.to(target_dtype)
+            sin = sin.to(target_dtype)
+
         # Return shape: [1, 1, S, head_dim] for broadcasting with [B, num_heads, S, head_dim]
-        return (
-            self.cos_cached[:seq_len].to(x.dtype)[None, None, :, :],
-            self.sin_cached[:seq_len].to(x.dtype)[None, None, :, :]
-        )
+        return (cos[None, None, :, :], sin[None, None, :, :])
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -91,7 +98,7 @@ class SwiGLU(nn.Module):
 
 class TRMAttention(nn.Module):
     """
-    RoPE-enabled Causal Self-Attention (Qwen-compatible).
+    RoPE-enabled Causal Self-Attention (Qwen-compatible) with KV cache support.
     head_dim=128 matches Qwen's head dimension for RoPE frequency compatibility.
     """
     def __init__(self, d_model: int, num_heads: int, bias: bool = False):
@@ -113,8 +120,24 @@ class TRMAttention(nn.Module):
         x: torch.Tensor,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
-        is_causal: bool = True
-    ) -> torch.Tensor:
+        is_causal: bool = True,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None
+    ):
+        """
+        Args:
+            x: Input tensor [B, S, D] or [B, 1, D] for incremental decoding
+            cos, sin: RoPE embeddings
+            is_causal: Use causal attention mask
+            past_kv: Cached (k, v) from past tokens [B, num_heads, past_len, head_dim]
+            use_cache: Whether to return new KV for caching
+            attention_mask: [B, S] or [B, 1, S, S] mask for padded sequences
+
+        Returns:
+            output: Attention output [B, S, D]
+            new_kv: (k, v) tuple if use_cache=True
+        """
         B, S, D = x.shape
 
         # Project to Q, K, V
@@ -126,22 +149,52 @@ class TRMAttention(nn.Module):
         if cos is not None and sin is not None:
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
+        # KV cache: concat past KV with current
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=2)
+            v = torch.cat([past_v, v], dim=2)
+
+        # Prepare new KV for cache (before attention, after RoPE)
+        new_kv = (k, v) if use_cache else None
+
+        # Build attention mask for SDPA
+        # When using KV cache, is_causal should be False (we handle causality via cache structure)
+        use_causal = is_causal and past_kv is None
+        attn_mask = None
+
+        if attention_mask is not None and not use_causal:
+            # Convert [B, total_len] to [B, 1, 1, total_len] for broadcasting
+            # total_len = past_len + current_len
+            total_len = k.size(2)
+            if attention_mask.dim() == 2:
+                # Expand to [B, 1, 1, total_len]
+                attn_mask = attention_mask[:, None, None, :total_len]
+                # Convert to additive mask: 0 -> 0, 1 -> -inf (but we want opposite)
+                # attention_mask: 1 = attend, 0 = ignore
+                attn_mask = attn_mask.to(dtype=q.dtype)
+                attn_mask = (1.0 - attn_mask) * torch.finfo(q.dtype).min
+
         # Scaled Dot-Product Attention (Flash Attention backend)
         attn_out = F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=0.0,
-            is_causal=is_causal
+            is_causal=use_causal
         )
 
         # Reshape and output projection
         attn_out = attn_out.transpose(1, 2).reshape(B, S, D)
-        return self.o_proj(attn_out)
+        output = self.o_proj(attn_out)
+
+        if use_cache:
+            return output, new_kv
+        return output
 
 
 class TRMBlock(nn.Module):
     """
-    Transformer Block with RoPE (Qwen-compatible structure).
+    Transformer Block with RoPE (Qwen-compatible structure) and KV cache support.
 
     Structure (same order as Qwen):
         1. RMSNorm -> RoPE Attention -> Residual
@@ -183,25 +236,44 @@ class TRMBlock(nn.Module):
         h: torch.Tensor,
         cos: Optional[torch.Tensor] = None,
         sin: Optional[torch.Tensor] = None,
-        is_causal: bool = True
-    ) -> torch.Tensor:
+        is_causal: bool = True,
+        past_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        attention_mask: Optional[torch.Tensor] = None
+    ):
         """
         Args:
-            h: Pre-fused input (x+y+z or y+z) [B, S, D]
+            h: Pre-fused input (x+y+z or y+z) [B, S, D] or [B, 1, D]
             cos, sin: RoPE embeddings [1, 1, S, head_dim]
+            past_kv: Cached KV from past tokens
+            use_cache: Whether to return KV cache
+            attention_mask: [B, total_len] mask for padded sequences
         Returns:
             output: Processed state [B, S, D]
+            new_kv: (k, v) tuple if use_cache=True
         """
         # TRM uses DIRECT REPLACEMENT (no residual!)
         # This is different from standard Transformers
         # With Zero Init, output starts as 0, not as input
 
         # Attention with RoPE (no residual)
-        h_attn = self.attn(self.norm1(h), cos, sin, is_causal)
+        if use_cache:
+            h_attn, new_kv = self.attn(
+                self.norm1(h), cos, sin, is_causal, past_kv,
+                use_cache=True, attention_mask=attention_mask
+            )
+        else:
+            h_attn = self.attn(
+                self.norm1(h), cos, sin, is_causal, past_kv,
+                use_cache=False, attention_mask=attention_mask
+            )
+            new_kv = None
 
         # SwiGLU FFN (no residual)
         out = self.mlp(self.norm2(h_attn))
 
+        if use_cache:
+            return out, new_kv
         return out
 
 
