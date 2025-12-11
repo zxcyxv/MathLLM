@@ -4,7 +4,7 @@ Implements Level 2: Deep Recursion (Paper Figure 3)
 With RoPE support and Qwen lm_head initialization
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -97,30 +97,39 @@ class QwenTRM(nn.Module):
     def encode_backbone(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[tuple] = None,
+        use_cache: bool = False
+    ):
         """
         Encode input with backbone only (frozen, run once per batch).
 
         Args:
             input_ids: Input token IDs [B, S]
             attention_mask: Attention mask [B, S]
+            past_key_values: Cached KV from previous calls
+            use_cache: Whether to return KV cache
 
         Returns:
             hidden_states: Backbone output [B, S, backbone_dim]
+            past_key_values: (optional) KV cache if use_cache=True
         """
         assert self.backbone is not None, "Backbone not set. Call set_backbone() first."
 
         backbone_output = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True
+            output_hidden_states=True,
+            past_key_values=past_key_values,
+            use_cache=use_cache
         )
         if hasattr(backbone_output, 'hidden_states') and backbone_output.hidden_states is not None:
             hidden_states = backbone_output.hidden_states[-1]
         else:
             hidden_states = backbone_output.last_hidden_state
 
+        if use_cache:
+            return hidden_states, backbone_output.past_key_values
         return hidden_states
 
     def encode(
@@ -181,8 +190,9 @@ class QwenTRM(nn.Module):
             with torch.no_grad():
                 hidden_states = self.encode_backbone(input_ids, attention_mask)
 
-        # Project to TRM latent space (runs each supervision step, trainable)
-        x = self.interface.extract_context(hidden_states)
+        # TRM operates at same dimension as Qwen (identity projection)
+        # Inlined from interface.extract_context() for minimal overhead
+        x = hidden_states
 
         B, S, _ = x.shape
 
@@ -197,10 +207,10 @@ class QwenTRM(nn.Module):
         # Deep Recursion: T-1 times no_grad + 1 time grad
         with torch.no_grad():
             for _ in range(self.T - 1):
-                y, z = self.engine(x, y, z, cos, sin)
+                y, z, _ = self.engine(x, y, z, cos, sin)
 
         # Last 1 time: with gradient (for learning)
-        y, z = self.engine(x, y, z, cos, sin)
+        y, z, _ = self.engine(x, y, z, cos, sin)
 
         # Compute logits
         logits = self.heads(y)
@@ -249,45 +259,89 @@ class QwenTRM(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 100,
-        num_supervision_steps: int = None
+        num_supervision_steps: int = None,
+        eos_token_id: Optional[int] = None
     ) -> torch.Tensor:
         """
-        Generate tokens autoregressively.
+        Generate tokens autoregressively with efficient KV cache.
+
+        Key optimization: Only process the CURRENT token through 16 supervision steps.
+        Past tokens' KV are cached and reused.
 
         Args:
             input_ids: Input token IDs [B, S]
             attention_mask: Attention mask [B, S]
             max_new_tokens: Maximum tokens to generate
             num_supervision_steps: Number of supervision steps (default: N_supervision)
+            eos_token_id: Token ID to stop generation
 
         Returns:
-            Generated token IDs [B, S + max_new_tokens]
+            Generated token IDs [B, S + generated_tokens]
         """
         if num_supervision_steps is None:
             num_supervision_steps = self.config.N_supervision
 
         self.eval()
+        B = input_ids.size(0)
+        D = self.config.d_lat
+        device = input_ids.device
         generated = input_ids.clone()
 
         with torch.no_grad():
-            for _ in range(max_new_tokens):
-                # Run N_sup supervision steps for each token
-                y, z = None, None
-                for _ in range(num_supervision_steps):
-                    output = self.forward(
-                        input_ids=generated,
-                        attention_mask=attention_mask,
-                        y=y, z=z
+            # ================================================================
+            # PREFILL: Process entire prompt
+            # ================================================================
+            hidden_states, backbone_kv = self.encode_backbone(
+                input_ids, attention_mask, use_cache=True
+            )
+            S = hidden_states.size(1)
+
+            # Cache x (backbone hidden states)
+            x_cache = hidden_states  # [B, S, D]
+
+            # Initialize y, z for all positions
+            y_cache, z_cache = self.interface.initialize_states(x_cache)
+
+            # Compute full RoPE for max sequence length (cache for reuse)
+            max_seq = S + max_new_tokens
+            cos_full, sin_full = self.rotary_emb(hidden_states, max_seq)
+
+            # Get RoPE for prefill positions
+            cos_prefill = cos_full[:, :, :S, :]
+            sin_prefill = sin_full[:, :, :S, :]
+
+            # Run 16 * T supervision for prefill, cache KV from LAST iteration
+            trm_kv_cache = None
+            for sup_step in range(num_supervision_steps):
+                for t in range(self.T):
+                    # Only cache on the very last iteration
+                    is_last = (sup_step == num_supervision_steps - 1) and (t == self.T - 1)
+                    y_cache, z_cache, new_kvs = self.engine(
+                        x_cache, y_cache, z_cache,
+                        cos_prefill, sin_prefill,
+                        past_kvs=None,  # No past for prefill
+                        use_cache=is_last,
+                        attention_mask=attention_mask  # Pass mask for batch > 1
                     )
-                    y = output['y']
-                    z = output['z']
+                    if is_last:
+                        trm_kv_cache = new_kvs  # List of (k, v) for n+1 virtual layers
 
-                # Get next token
-                next_token_logits = output['logits'][:, -1, :]
-                next_token = next_token_logits.argmax(dim=-1, keepdim=True)
+            # ================================================================
+            # DECODE: Generate tokens one by one
+            # ================================================================
+            current_len = S
 
-                # Append to sequence
+            for token_idx in range(max_new_tokens):
+                # Predict next token from last position's y
+                logits = self.heads(y_cache[:, -1:, :])  # [B, 1, V]
+                next_token = logits[:, 0, :].argmax(dim=-1, keepdim=True)  # [B, 1]
+
+                # Append to generated sequence FIRST (so EOS is included)
                 generated = torch.cat([generated, next_token], dim=-1)
+
+                # Check for EOS AFTER appending
+                if eos_token_id is not None and (next_token == eos_token_id).all():
+                    break
 
                 # Update attention mask
                 if attention_mask is not None:
@@ -296,12 +350,73 @@ class QwenTRM(nn.Module):
                         torch.ones_like(next_token)
                     ], dim=-1)
 
+                # Get new token's backbone hidden state
+                new_hidden, backbone_kv = self.encode_backbone(
+                    next_token, attention_mask,
+                    past_key_values=backbone_kv,
+                    use_cache=True
+                )
+
+                # Initialize new position's y, z
+                new_y = self.interface.y_init.expand(B, 1, -1).clone()
+                new_z = torch.zeros(B, 1, D, device=device, dtype=new_hidden.dtype)
+
+                # Get RoPE for new position only
+                cos_new = cos_full[:, :, current_len:current_len+1, :]
+                sin_new = sin_full[:, :, current_len:current_len+1, :]
+
+                # Run 16 * T supervision for NEW TOKEN ONLY
+                # Q: current token (changes during loop)
+                # K, V: from cache (past tokens, fixed) + current token
+                for sup_step in range(num_supervision_steps):
+                    for t in range(self.T):
+                        is_last = (sup_step == num_supervision_steps - 1) and (t == self.T - 1)
+                        new_y, new_z, new_kvs = self.engine(
+                            x=new_hidden,  # [B, 1, D] - current token only
+                            y=new_y,       # [B, 1, D] - current token's y
+                            z=new_z,       # [B, 1, D] - current token's z
+                            cos=cos_new,   # RoPE for position current_len
+                            sin=sin_new,
+                            past_kvs=trm_kv_cache,  # Past tokens' K/V
+                            use_cache=is_last,
+                            attention_mask=attention_mask  # Updated mask including new token
+                        )
+                        if is_last:
+                            # Append current token's K/V to cache
+                            trm_kv_cache = self._merge_kv_cache(trm_kv_cache, new_kvs)
+
+                # Update state caches (append new position)
+                x_cache = torch.cat([x_cache, new_hidden], dim=1)
+                y_cache = torch.cat([y_cache, new_y], dim=1)
+                z_cache = torch.cat([z_cache, new_z], dim=1)
+                current_len += 1
+
         return generated
+
+    def _merge_kv_cache(
+        self,
+        past_kvs: List[Tuple[torch.Tensor, torch.Tensor]],
+        new_kvs: List[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Merge new token's KV into existing cache.
+
+        Args:
+            past_kvs: List of (k, v) for each virtual layer, k: [B, heads, past_len, head_dim]
+            new_kvs: List of (k, v) for each virtual layer, k: [B, heads, past_len+1, head_dim]
+                     (already includes past from attention forward)
+
+        Returns:
+            Updated cache with new token appended
+        """
+        # new_kvs already has past concatenated from TRMAttention.forward
+        # Just return as-is
+        return new_kvs
 
     @classmethod
     def from_pretrained_backbone(
         cls,
-        backbone_name: str = "Qwen/Qwen2.5-Math-7B",
+        backbone_name: str = "Qwen/Qwen2.5-Math-1.5B-Instruct",
         config: Optional[TRMConfig] = None,
         device: str = "cuda",
         init_lm_head: bool = True

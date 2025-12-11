@@ -3,6 +3,9 @@ TRM Evaluation Script
 Supports both:
 - Identity test (untrained TRM)
 - Trained TRM evaluation (with checkpoint loading)
+
+CRITICAL: Uses Qwen's official ChatML format via apply_chat_template().
+Must match the training format exactly.
 """
 
 import argparse
@@ -20,15 +23,25 @@ from src.model import QwenTRM
 from src.config import TRMConfig
 
 
+# System prompt - MUST match training exactly
+SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
+
+
 def extract_answer(text: str) -> int:
-    """Extract numeric answer from model output."""
-    # Try #### pattern first
-    match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
+    """Extract numeric answer from model output.
+
+    Supports multiple formats:
+    - \\boxed{123} (Qwen-Math style)
+    - #### 123 (GSM8K style)
+    - The answer is 123
+    """
+    # Try \\boxed{} first (Qwen-Math default format)
+    match = re.search(r"\\boxed\{(-?\d+(?:,\d+)*(?:\.\d+)?)\}", text)
     if match:
         return int(float(match.group(1).replace(",", "")))
 
-    # Try \\boxed{}
-    match = re.search(r"\\boxed\{(-?\d+(?:,\d+)*(?:\.\d+)?)\}", text)
+    # Try #### pattern (GSM8K format)
+    match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
     if match:
         return int(float(match.group(1).replace(",", "")))
 
@@ -37,27 +50,40 @@ def extract_answer(text: str) -> int:
     if match:
         return int(float(match.group(1).replace(",", "")))
 
-    # Last number
+    # Last number as fallback
     numbers = re.findall(r"(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
     if numbers:
-        return int(float(numbers[-1].replace(",", "")))
+        try:
+            val = float(numbers[-1].replace(",", ""))
+            if val != float('inf') and val != float('-inf') and abs(val) < 1e15:
+                return int(val)
+        except (ValueError, OverflowError):
+            pass
 
     return None
 
 
 def extract_ground_truth(answer_text: str) -> int:
+    """Extract ground truth from GSM8K answer format."""
     match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", answer_text)
     if match:
         return int(float(match.group(1).replace(",", "")))
     return None
 
 
-def format_prompt(question: str) -> str:
-    return f"""Solve this math problem step by step. Show your work and put your final answer after ####.
+def create_messages(question: str) -> list:
+    """Create ChatML message format for inference.
 
-Question: {question}
+    Args:
+        question: The math problem
 
-Solution:"""
+    Returns:
+        List of message dicts for apply_chat_template
+    """
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
 
 
 def load_trm_checkpoint(model: QwenTRM, checkpoint_path: str, device: str = "cuda"):
@@ -77,15 +103,35 @@ def load_trm_checkpoint(model: QwenTRM, checkpoint_path: str, device: str = "cud
     return model
 
 
+def print_sample_output(idx: int, question: str, response: str, predicted: int,
+                        ground_truth: int, is_correct: bool):
+    """Print detailed output for a single sample."""
+    status = "✓ CORRECT" if is_correct else "✗ WRONG"
+    print("\n" + "─" * 60)
+    print(f"[Sample {idx}] {status}")
+    print("─" * 60)
+    print(f"Question: {question[:200]}{'...' if len(question) > 200 else ''}")
+    print(f"\nModel Output:")
+    print("-" * 40)
+    print(response[:1000] if response else "(empty)")
+    if len(response) > 1000:
+        print(f"... (truncated, total {len(response)} chars)")
+    print("-" * 40)
+    print(f"Predicted: {predicted} | Ground Truth: {ground_truth}")
+    print("─" * 60)
+
+
 def evaluate_trm(
-    model_name: str = "Qwen/Qwen2.5-Math-7B-Instruct",
+    model_name: str = "Qwen/Qwen2.5-Math-1.5B-Instruct",
     checkpoint_path: str = None,
     num_samples: int = None,
     max_new_tokens: int = 512,
     num_supervision_steps: int = 16,
     batch_size: int = 1,
     use_amp: bool = True,
-    device: str = "cuda"
+    device: str = "cuda",
+    verbose: bool = False,
+    show_wrong_only: bool = False
 ):
     """Evaluate QwenTRM on GSM8K test set.
 
@@ -98,6 +144,8 @@ def evaluate_trm(
         batch_size: Batch size for evaluation
         use_amp: Use automatic mixed precision (bfloat16)
         device: Device to use
+        verbose: Print detailed model outputs for each sample
+        show_wrong_only: Only show outputs for wrong predictions (requires verbose=True)
     """
     is_trained = checkpoint_path is not None
 
@@ -109,9 +157,14 @@ def evaluate_trm(
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # DON'T override pad_token - use Qwen's default (<|endoftext|>)
     tokenizer.padding_side = "left"  # For batch generation
+
+    # Get EOS token ID for stopping generation
+    # For Qwen2.5, EOS is <|im_end|> (ID: 151645)
+    eos_token_id = tokenizer.eos_token_id
+    print(f"EOS token: {repr(tokenizer.eos_token)} (ID: {eos_token_id})")
+    print(f"PAD token: {repr(tokenizer.pad_token)} (ID: {tokenizer.pad_token_id})")
 
     # Load QwenTRM
     config = TRMConfig()
@@ -143,19 +196,30 @@ def evaluate_trm(
 
     print(f"Evaluating on {len(dataset)} samples...")
 
-    # Prepare all data
+    # Prepare all data with ChatML format
     all_items = []
     for item in dataset:
         ground_truth = extract_ground_truth(item["answer"])
         if ground_truth is not None:
+            # Create ChatML prompt using apply_chat_template
+            messages = create_messages(item["question"])
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True  # Adds "<|im_start|>assistant\n"
+            )
             all_items.append({
                 "question": item["question"],
                 "answer": item["answer"],
                 "ground_truth": ground_truth,
-                "prompt": format_prompt(item["question"])
+                "prompt": prompt
             })
 
     print(f"Valid samples: {len(all_items)}")
+
+    # Debug: show first prompt
+    if all_items:
+        print(f"[Debug] First prompt format:\n{repr(all_items[0]['prompt'][:300])}")
 
     correct = 0
     total = 0
@@ -183,18 +247,23 @@ def evaluate_trm(
         with torch.no_grad():
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=use_amp):
                 # Generate using QwenTRM
+                # NOTE: Don't pass attention_mask - causes repetition bug in TRM generate
                 generated = model.generate(
                     input_ids=inputs['input_ids'],
-                    attention_mask=inputs.get('attention_mask'),
                     max_new_tokens=max_new_tokens,
-                    num_supervision_steps=num_supervision_steps
+                    num_supervision_steps=num_supervision_steps,
+                    eos_token_id=eos_token_id
                 )
 
         # Decode and evaluate each sample in batch
+        # Get per-sample input lengths (excluding padding)
+        input_lengths = inputs['attention_mask'].sum(dim=1).tolist()
+        padded_len = inputs['input_ids'].size(1)
+
         for i, item in enumerate(batch_items):
-            response = tokenizer.decode(generated[i], skip_special_tokens=True)
-            prompt_len = len(item["prompt"])
-            response_only = response[prompt_len:]
+            # For left-padding: actual content starts at (padded_len - input_lengths[i])
+            # Generated tokens start after padded_len
+            response_only = tokenizer.decode(generated[i, padded_len:], skip_special_tokens=True)
 
             predicted = extract_answer(response_only)
             ground_truth = item["ground_truth"]
@@ -211,6 +280,17 @@ def evaluate_trm(
                 "correct": is_correct,
                 "response": response_only[:500]
             })
+
+            # Verbose output
+            if verbose and (not show_wrong_only or not is_correct):
+                print_sample_output(
+                    idx=total,
+                    question=item["question"],
+                    response=response_only,
+                    predicted=predicted,
+                    ground_truth=ground_truth,
+                    is_correct=is_correct
+                )
 
         # Progress update
         if (batch_idx + 1) % 10 == 0:
@@ -265,6 +345,10 @@ def main():
                         help="Disable AMP, use float32")
     parser.add_argument("--output", type=str, default=None,
                         help="Output file for results (default: auto-generated)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print detailed model outputs for each sample")
+    parser.add_argument("--wrong-only", action="store_true",
+                        help="Only show outputs for wrong predictions (requires --verbose)")
 
     args = parser.parse_args()
 
@@ -283,7 +367,9 @@ def main():
         max_new_tokens=args.max_new_tokens,
         num_supervision_steps=args.supervision_steps,
         batch_size=args.batch_size,
-        use_amp=args.amp
+        use_amp=args.amp,
+        verbose=args.verbose,
+        show_wrong_only=args.wrong_only
     )
 
     with open(args.output, "w") as f:

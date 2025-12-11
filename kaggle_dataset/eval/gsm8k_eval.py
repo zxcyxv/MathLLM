@@ -1,6 +1,8 @@
 """
 GSM8K Evaluation Script
 Phase 1: Qwen Baseline + TRM Identity Test
+
+CRITICAL: Uses Qwen's official ChatML format via apply_chat_template().
 """
 
 import argparse
@@ -12,22 +14,25 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
+# System prompt - same as training for consistency
+SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
+
+
 def extract_answer(text: str) -> int:
     """Extract numeric answer from model output.
 
     Handles multiple formats:
-    - #### 12345
+    - \\boxed{12345} (Qwen-Math style, check first)
+    - #### 12345 (GSM8K format)
     - The answer is 12345
-    - \\boxed{12345}
-    - Final answer: 12345
     """
-    # Try #### pattern first (GSM8K format)
-    match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
+    # Try \\boxed{} pattern first (Qwen-Math default)
+    match = re.search(r"\\boxed\{(-?\d+(?:,\d+)*(?:\.\d+)?)\}", text)
     if match:
         return int(float(match.group(1).replace(",", "")))
 
-    # Try \\boxed{} pattern
-    match = re.search(r"\\boxed\{(-?\d+(?:,\d+)*(?:\.\d+)?)\}", text)
+    # Try #### pattern (GSM8K format)
+    match = re.search(r"####\s*(-?\d+(?:,\d+)*(?:\.\d+)?)", text)
     if match:
         return int(float(match.group(1).replace(",", "")))
 
@@ -52,23 +57,42 @@ def extract_ground_truth(answer_text: str) -> int:
     return None
 
 
-def format_prompt(question: str) -> str:
-    """Format question into chat prompt for Qwen."""
-    return f"""Solve this math problem step by step. Show your work and put your final answer after ####.
+def create_messages(question: str) -> list:
+    """Create ChatML message format for Qwen."""
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
 
-Question: {question}
 
-Solution:"""
+def print_sample_output(idx: int, question: str, response: str, predicted: int,
+                        ground_truth: int, is_correct: bool):
+    """Print detailed output for a single sample."""
+    status = "✓ CORRECT" if is_correct else "✗ WRONG"
+    print("\n" + "─" * 60)
+    print(f"[Sample {idx}] {status}")
+    print("─" * 60)
+    print(f"Question: {question[:200]}{'...' if len(question) > 200 else ''}")
+    print(f"\nModel Output:")
+    print("-" * 40)
+    print(response[:1000] if response else "(empty)")
+    if len(response) > 1000:
+        print(f"... (truncated, total {len(response)} chars)")
+    print("-" * 40)
+    print(f"Predicted: {predicted} | Ground Truth: {ground_truth}")
+    print("─" * 60)
 
 
 def evaluate_qwen_baseline(
-    model_name: str = "Qwen/Qwen2.5-Math-7B-Instruct",
+    model_name: str = "Qwen/Qwen2.5-Math-1.5B-Instruct",
     num_samples: int = None,
     batch_size: int = 1,
     max_new_tokens: int = 512,
-    device: str = "cuda"
+    device: str = "cuda",
+    verbose: bool = False,
+    show_wrong_only: bool = False
 ):
-    """Evaluate Qwen model on GSM8K test set."""
+    """Evaluate Qwen model on GSM8K test set using proper ChatML format."""
 
     print(f"Loading model: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -80,8 +104,9 @@ def evaluate_qwen_baseline(
     )
     model.eval()
 
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # DON'T override pad_token - use Qwen's defaults
+    print(f"EOS token: {repr(tokenizer.eos_token)} (ID: {tokenizer.eos_token_id})")
+    print(f"PAD token: {repr(tokenizer.pad_token)} (ID: {tokenizer.pad_token_id})")
 
     print("Loading GSM8K test set...")
     dataset = load_dataset("gsm8k", "main", split="test")
@@ -103,7 +128,13 @@ def evaluate_qwen_baseline(
         if ground_truth is None:
             continue
 
-        prompt = format_prompt(question)
+        # Use ChatML format via apply_chat_template
+        messages = create_messages(question)
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True  # Adds "<|im_start|>assistant\n"
+        )
 
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -117,8 +148,9 @@ def evaluate_qwen_baseline(
                 eos_token_id=tokenizer.eos_token_id
             )
 
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response_only = response[len(prompt):]
+        # Only decode the NEW tokens (after input_ids)
+        input_len = inputs['input_ids'].size(1)
+        response_only = tokenizer.decode(outputs[0, input_len:], skip_special_tokens=True)
 
         predicted = extract_answer(response_only)
 
@@ -134,6 +166,17 @@ def evaluate_qwen_baseline(
             "correct": is_correct,
             "response": response_only[:500]  # Truncate for storage
         })
+
+        # Verbose output
+        if verbose and (not show_wrong_only or not is_correct):
+            print_sample_output(
+                idx=total,
+                question=question,
+                response=response_only,
+                predicted=predicted,
+                ground_truth=ground_truth,
+                is_correct=is_correct
+            )
 
         if total % 50 == 0:
             print(f"Progress: {total}/{len(dataset)}, Accuracy: {correct/total*100:.2f}%")
@@ -167,6 +210,10 @@ def main():
                         help="Output file for results")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print detailed model outputs for each sample")
+    parser.add_argument("--wrong-only", action="store_true",
+                        help="Only show outputs for wrong predictions (requires --verbose)")
 
     args = parser.parse_args()
 
@@ -174,7 +221,9 @@ def main():
         model_name=args.model,
         num_samples=args.num_samples,
         max_new_tokens=args.max_new_tokens,
-        device=args.device
+        device=args.device,
+        verbose=args.verbose,
+        show_wrong_only=args.wrong_only
     )
 
     # Save results

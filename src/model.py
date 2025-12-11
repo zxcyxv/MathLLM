@@ -336,12 +336,12 @@ class QwenTRM(nn.Module):
                 logits = self.heads(y_cache[:, -1:, :])  # [B, 1, V]
                 next_token = logits[:, 0, :].argmax(dim=-1, keepdim=True)  # [B, 1]
 
-                # Check for EOS
+                # Append to generated sequence FIRST (so EOS is included)
+                generated = torch.cat([generated, next_token], dim=-1)
+
+                # Check for EOS AFTER appending
                 if eos_token_id is not None and (next_token == eos_token_id).all():
                     break
-
-                # Append to generated sequence
-                generated = torch.cat([generated, next_token], dim=-1)
 
                 # Update attention mask
                 if attention_mask is not None:
@@ -416,7 +416,7 @@ class QwenTRM(nn.Module):
     @classmethod
     def from_pretrained_backbone(
         cls,
-        backbone_name: str = "Qwen/Qwen2.5-Math-7B",
+        backbone_name: str = "Qwen/Qwen2.5-Math-1.5B-Instruct",
         config: Optional[TRMConfig] = None,
         device: str = "cuda",
         init_lm_head: bool = True
