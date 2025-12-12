@@ -283,6 +283,88 @@ scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps)
 
 ---
 
+## 11. GSM8K CoT 형식이 Qwen과 불일치
+
+### 문제
+GSM8K의 CoT 형식이 Qwen2.5-Math의 선호 형식과 다름:
+
+**GSM8K 형식:**
+```
+Natalia sold 48/2 = <<48/2=24>>24 clips in May.
+Natalia sold 48+24 = <<48+24=72>>72 clips altogether.
+\boxed{72}
+```
+
+**Qwen 선호 형식:**
+```
+Step 1: Calculate clips sold in May.
+48/2 = 24 clips
+
+Step 2: Calculate total clips.
+48 + 24 = 72 clips
+
+Therefore, the answer is \boxed{72}
+```
+
+### 증상
+- 모델이 `<<계산>>` 형식에 혼란
+- 엉뚱한 단어 출력 (예: "tree", "buttons" 등 다른 문제의 단어)
+- 추론 로직은 맞지만 형식이 이상함
+
+### 해결
+**NuminaMath-CoT 사용 권장** - 이미 깔끔한 CoT 형식으로 되어 있음:
+```bash
+python train_trm.py --dataset numina --num_samples 50000 --epochs 1
+```
+
+---
+
+## 12. 훈련 속도 최적화 시도 - 전부 무의미
+
+### 시도한 방법들
+| 방법 | 결과 |
+|------|------|
+| torch.compile default | +4% (유일하게 효과 있음) |
+| torch.compile max-autotune | CUDAGraph 충돌로 에러 |
+| Liger-Kernel | 0% - Backbone에만 적용되어 TRM에 효과 없음 |
+| num_workers=4 | 0% - 데이터가 이미 메모리에 로드됨 |
+
+### 결론
+**TRM의 깊은 재귀 구조가 병목**이라 외부 최적화로는 개선 불가:
+```
+배치당 TRM 블록 호출 = N_sup × T × (n+1) × 2 = 16 × 3 × 7 × 2 = 672회
+```
+
+속도를 높이려면 하이퍼파라미터를 줄여야 함 (정확도 trade-off):
+- N_supervision 16→8: ~2배 속도
+- T_recursion 3→2: ~1.5배 속도
+
+### 참고: Python 버전
+Python 3.14+에서는 torch.compile 미지원. `requires-python = ">=3.11,<3.13"` 필요.
+
+---
+
+## 13. TRM 모델이 기본 Qwen보다 성능 낮음
+
+### 실험 결과
+NuminaMath 50K 샘플로 훈련한 TRM 모델 vs 기본 Qwen2.5-Math-1.5B-Instruct:
+
+| 데이터셋 | TRM (N_sup=8) | 기본 Qwen | 차이 |
+|---------|---------------|-----------|------|
+| GSM8K (20개) | 60% | 65% | -5% |
+| NuminaMath 50K+ | 50% | 54.3% | -4.3% |
+
+### 가능한 원인
+1. **훈련 부족** - 50K 샘플, 782 step으로는 TRM 수렴 안 됨
+2. **N_sup=8** - 속도 위해 줄였는데, 재귀 깊이 부족했을 수 있음
+3. **공정하지 않은 비교** - 기본 Qwen은 SFT+RL 거친 모델
+
+### 참고
+- 출력 품질은 좋아짐 (깔끔한 Step-by-step, `\boxed{}` 형식 준수)
+- 더 오래 훈련하거나 어려운 문제(AIMO)에서 테스트 필요
+
+---
+
 ## 요약 체크리스트
 
 훈련 전 확인사항:

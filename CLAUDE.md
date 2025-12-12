@@ -8,7 +8,7 @@
 
 ---
 
-## Current Status (2024-12)
+## Current Status (2025-12)
 
 ### ✅ 완료된 작업
 
@@ -22,6 +22,7 @@
    - GSM8K `#### N` → `\boxed{N}` 변환
    - Deep Supervision + EMA 구현
    - Gradient accumulation (Step-wise State Offloading)
+   - torch.compile 지원 (mode="default", 4% 속도 향상)
 
 3. **추론 파이프라인**
    - KV Cache 구현 (추론 속도 개선)
@@ -30,20 +31,25 @@
 
 4. **데이터셋 지원**
    - GSM8K (7.5K samples)
-   - NuminaMath-CoT (860K samples) ← **NEW**
+   - NuminaMath-CoT (860K samples) ← **권장**
    - MATH (7.5K samples)
 
 5. **평가 스크립트**
    - `eval/trm_eval_simple.py` (train/test split 지원)
+   - 다중 데이터셋 지원 (gsm8k, numina, math)
    - 전체 출력 표시 옵션
 
 6. **문서화**
    - `ARCHITECTURE.md` - 상세 아키텍처 문서
-   - `ISSUES.md` - 발견된 버그와 해결 방법
+   - `ISSUES.md` - 발견된 버그와 해결 방법 (14개 이슈)
+
+7. **훈련 속도 최적화 시도**
+   - torch.compile, Liger-Kernel, num_workers 등 테스트
+   - 결론: TRM 재귀 구조가 병목, 외부 최적화 무의미 (ISSUES.md #12 참조)
 
 ### 🔄 진행 중
 
-- NuminaMath-CoT 데이터셋으로 대규모 훈련 준비
+- NuminaMath-CoT 데이터셋으로 대규모 훈련 (Kaggle GPU 사용)
 
 ### 📋 TODO
 
@@ -108,8 +114,14 @@ python train_trm.py \
 # GSM8K test set 평가
 python eval/trm_eval_simple.py --checkpoint ./checkpoints/trm/checkpoint-XXX
 
-# 상세 출력
-python eval/trm_eval_simple.py --checkpoint ./checkpoints/trm/checkpoint-XXX -v
+# NuminaMath 평가 (권장)
+python eval/trm_eval_simple.py --checkpoint ./checkpoints/trm/checkpoint-XXX --dataset numina
+
+# MATH 데이터셋 평가
+python eval/trm_eval_simple.py --checkpoint ./checkpoints/trm/checkpoint-XXX --dataset math
+
+# 상세 출력 (틀린 것만)
+python eval/trm_eval_simple.py --checkpoint ./checkpoints/trm/checkpoint-XXX -v --wrong_only
 
 # train set으로 검증
 python eval/trm_eval_simple.py --checkpoint ./checkpoints/trm/checkpoint-XXX --split train
@@ -182,6 +194,7 @@ MathLLM/
 ├── ISSUES.md                    # 버그 및 해결 방법
 ├── train_trm.py                 # TRM 훈련 스크립트
 ├── upload_kaggle_dataset.py     # Kaggle 업로드 스크립트
+├── pyproject.toml               # Python 3.11-3.12 필수
 ├── src/
 │   ├── config.py                # TRMConfig
 │   ├── interface.py             # TRMInterface
@@ -191,8 +204,8 @@ MathLLM/
 │   ├── heads.py                 # TRMHeads
 │   └── train.py                 # Trainer
 ├── eval/
-│   ├── trm_eval_simple.py       # TRM 평가 (권장)
-│   └── gsm8k_eval.py            # GSM8K 평가
+│   ├── trm_eval_simple.py       # TRM 평가 (gsm8k/numina/math)
+│   └── gsm8k_eval.py            # GSM8K 평가 (legacy)
 └── checkpoints/                 # 모델 저장
 ```
 
@@ -207,10 +220,20 @@ MathLLM/
 3. **EOS 토큰 미학습**: labels에 EOS 포함 확인
 4. **attention_mask 버그**: `generate()` 시 mask 전달하면 반복 출력
 5. **Scheduler N_sup 누락**: total_steps에 N_supervision 반영 필수
+6. **GSM8K CoT 형식 불일치**: `<<계산>>` 형식이 Qwen과 안 맞음 → NuminaMath 권장
+7. **Python 3.14 미지원**: torch.compile 사용 시 Python 3.11-3.12 필수
+8. **torch.compile max-autotune**: CUDAGraph 충돌 → mode="default" 사용
 
 ---
 
 ## Critical Notes
+
+### Python 버전 요구사항
+```bash
+# Python 3.11 또는 3.12 필수 (torch.compile 지원)
+# Python 3.14+는 torch.compile 미지원
+requires-python = ">=3.11,<3.13"
+```
 
 ### ChatML 형식 필수
 ```python
@@ -222,10 +245,16 @@ messages = [
 text = tokenizer.apply_chat_template(messages, tokenize=False)
 ```
 
-### NuminaMath는 변환 불필요
+### NuminaMath 권장 (GSM8K 대신)
 ```python
-# GSM8K: convert_format=True (#### → \boxed)
-# NuminaMath/MATH: convert_format=False (이미 \boxed)
+# GSM8K 문제점:
+# - <<48/2=24>> 형식이 Qwen의 CoT 스타일과 불일치
+# - 훈련 후 이상한 출력 발생 가능 (다른 문제의 단어 혼입)
+
+# NuminaMath 장점:
+# - 이미 깔끔한 Step-by-step 형식
+# - \boxed{} 형식으로 변환 불필요
+# - 다양한 수학 문제 소스 (860K samples)
 ```
 
 ### generate() 시 attention_mask 제거
