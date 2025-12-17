@@ -28,7 +28,7 @@ class TinyRecursiveTransformer(nn.Module):
     def __init__(self, config: TRMConfig):
         super().__init__()
         self.config = config
-        self.n = config.n_latent  # n = 6
+        self.n = config.active_n_latent  # n = 6 (or 2 in DIS mode)
         self.num_virtual_layers = self.n + 1  # n for z updates + 1 for y update
 
         # Single shared transformer block with RoPE

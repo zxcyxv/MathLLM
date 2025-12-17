@@ -97,6 +97,12 @@ python train_trm.py --dataset numina --num_samples 100000 --epochs 1
 # MATH로 훈련 (7.5K, 경시대회 수준)
 python train_trm.py --dataset math --epochs 3
 
+# DIS 모드 훈련 (18.7x 빠른 훈련!)
+python train_trm.py --use_dis --dataset gsm8k --epochs 3
+
+# DIS + NuminaMath (권장)
+python train_trm.py --use_dis --dataset numina --num_samples 100000 --epochs 1
+
 # 옵션들
 python train_trm.py \
     --dataset numina \
@@ -105,6 +111,8 @@ python train_trm.py \
     --lr 1e-4 \
     --max_length 1024 \
     --freeze_lm_head \        # lm_head 고정 (TRM만 훈련)
+    --use_dis \               # DIS 모드 활성화 (18.7x 속도 향상)
+    --dis_noise_schedule linear \  # linear 또는 cosine
     --output_dir ./checkpoints/trm_numina
 ```
 
@@ -162,15 +170,39 @@ Qwen [3584] → Identity → TRM [3584] → Qwen lm_head [3584→vocab]
 
 ### 3-Level Recursion
 
+**Standard TRM Mode:**
+
 | Level | Parameter | Value | 역할 |
 |-------|-----------|-------|------|
 | Level 1 | N_supervision | 16 | Deep Supervision steps |
 | Level 2 | T_recursion | 3 | Deep Recursion (T-1 no_grad + 1 grad) |
 | Level 3 | n_latent | 6 | Latent Recursion (z updates) |
 
+**DIS Mode (Deep Improvement Supervision):**
+
+| Level | Parameter | Value | 역할 |
+|-------|-----------|-------|------|
+| Level 1 | N_supervision | 6 | Reduced supervision steps |
+| Level 2 | T_recursion | 1 | Single recursion (no gradient detachment) |
+| Level 3 | n_latent | 2 | Reduced latent recursion |
+
+**Key DIS Features:**
+- ✅ **18.7x 훈련 속도 향상** (672 → 36 effective depth)
+- ✅ Progressive target supervision (discrete diffusion)
+- ✅ Time step embedding for step awareness
+- ✅ Backward compatible with standard TRM
+
 ### Effective Depth
+
+**Standard TRM:**
 ```
 Depth = 2 × (n + 1) × T × N_sup = 2 × 7 × 3 × 16 = 672 layers
+```
+
+**DIS Mode:**
+```
+Depth = 2 × (n + 1) × T × N_sup = 2 × 3 × 1 × 6 = 36 layers
+Speedup = 672 / 36 = 18.67x
 ```
 
 ### Parameter Count
@@ -196,16 +228,19 @@ MathLLM/
 ├── upload_kaggle_dataset.py     # Kaggle 업로드 스크립트
 ├── pyproject.toml               # Python 3.11-3.12 필수
 ├── src/
-│   ├── config.py                # TRMConfig
-│   ├── interface.py             # TRMInterface
+│   ├── config.py                # TRMConfig (DIS support)
+│   ├── interface.py             # TRMInterface (time embedding)
 │   ├── layers.py                # TRMBlock, TRMAttention, RoPE
 │   ├── engine.py                # TinyRecursiveTransformer
 │   ├── model.py                 # QwenTRM
 │   ├── heads.py                 # TRMHeads
-│   └── train.py                 # Trainer
+│   ├── train.py                 # Trainer (DIS support)
+│   └── dis_utils.py             # DISTargetGenerator (NEW!)
 ├── eval/
 │   ├── trm_eval_simple.py       # TRM 평가 (gsm8k/numina/math)
 │   └── gsm8k_eval.py            # GSM8K 평가 (legacy)
+├── tests/
+│   └── test_dis.py              # DIS unit tests (NEW!)
 └── checkpoints/                 # 모델 저장
 ```
 

@@ -35,6 +35,31 @@ class TRMConfig:
     use_ema: bool = True
     ema_decay: float = 0.999
 
+    # DIS (Deep Improvement Supervision) Mode
+    use_dis: bool = False             # Enable DIS training
+    dis_n_latent: int = 2             # Reduced from 6
+    dis_T_recursion: int = 1          # Reduced from 3
+    dis_N_supervision: int = 6        # Reduced from 16
+
+    # Target corruption settings
+    dis_noise_schedule: str = "linear"  # "linear" or "cosine"
+    dis_corruption_strategy: str = "random_token"
+
+    @property
+    def active_n_latent(self) -> int:
+        """Get active n_latent based on DIS mode"""
+        return self.dis_n_latent if self.use_dis else self.n_latent
+
+    @property
+    def active_T_recursion(self) -> int:
+        """Get active T_recursion based on DIS mode"""
+        return self.dis_T_recursion if self.use_dis else self.T_recursion
+
+    @property
+    def active_N_supervision(self) -> int:
+        """Get active N_supervision based on DIS mode"""
+        return self.dis_N_supervision if self.use_dis else self.N_supervision
+
     @property
     def d_ff(self) -> int:
         """FFN hidden dimension"""

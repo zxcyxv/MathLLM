@@ -181,7 +181,7 @@ class Trainer:
     def _setup_scheduler(self) -> CosineAnnealingLR:
         """Setup cosine annealing scheduler"""
         # Account for N_sup optimizer steps per accumulated batch
-        N_sup = self.model_config.N_supervision
+        N_sup = self.model_config.active_N_supervision
         acc_steps = self.config.gradient_accumulation_steps
         # With accumulation, we update once per acc_steps batches, N_sup times
         num_accumulated_batches = len(self.train_dataloader) // acc_steps
@@ -303,7 +303,7 @@ class Trainer:
         and weights are updated BETWEEN steps (matching paper's intention).
         """
         acc_steps = len(micro_batches)
-        N_sup = self.model_config.N_supervision
+        N_sup = self.model_config.active_N_supervision
         total_loss = 0.0
 
         # 1. Pre-encode all micro-batches with backbone
@@ -311,6 +311,16 @@ class Trainer:
         all_labels = []
         all_cos = []
         all_sin = []
+
+        # DIS: Create target generator if needed
+        dis_generator = None
+        if self.model_config.use_dis:
+            from .dis_utils import DISTargetGenerator
+            dis_generator = DISTargetGenerator(
+                vocab_size=self.model_config.vocab_size,
+                N_supervision=N_sup,
+                noise_schedule=self.model_config.dis_noise_schedule
+            )
 
         with torch.no_grad():
             for batch in micro_batches:
@@ -332,11 +342,25 @@ class Trainer:
                 all_cos.append(cos.cpu())
                 all_sin.append(sin.cpu())
 
-        # 2. Initialize y, z states for all micro-batches (on CPU)
+        # 2. Generate intermediate targets for DIS
+        all_target_lists = []
+        if dis_generator is not None:
+            for labels in all_labels:
+                # Generate targets for this batch
+                labels_on_device = labels.to(self.device)
+                targets = dis_generator.generate_targets(labels_on_device, self.device)
+                # Store as list per batch (on CPU to save memory)
+                all_target_lists.append([t.cpu() for t in targets])
+        else:
+            # Standard TRM: same target for all steps
+            for labels in all_labels:
+                all_target_lists.append([labels] * N_sup)
+
+        # 3. Initialize y, z states for all micro-batches (on CPU)
         all_y = [None] * acc_steps
         all_z = [None] * acc_steps
 
-        # 3. Deep Supervision Loop
+        # 4. Deep Supervision Loop
         for sup_step in range(N_sup):
             self.optimizer.zero_grad()
             step_loss = 0.0
@@ -345,9 +369,11 @@ class Trainer:
             for i in range(acc_steps):
                 # Load data to GPU (non_blocking for async transfer)
                 hidden_states = all_hidden_states[i].to(self.device, non_blocking=True)
-                labels = all_labels[i].to(self.device, non_blocking=True)
                 cos = all_cos[i].to(self.device, non_blocking=True)
                 sin = all_sin[i].to(self.device, non_blocking=True)
+
+                # Load step-specific target for DIS
+                step_target = all_target_lists[i][sup_step].to(self.device, non_blocking=True)
 
                 # Load states (None on first step, from CPU otherwise)
                 y = all_y[i].to(self.device, non_blocking=True) if all_y[i] is not None else None
@@ -356,12 +382,13 @@ class Trainer:
                 # Forward with AMP
                 with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                     outputs = self.model(
-                        labels=labels,
+                        labels=step_target,  # Use step-specific target
                         y=y,
                         z=z,
                         hidden_states=hidden_states,
                         cos=cos,
-                        sin=sin
+                        sin=sin,
+                        step_index=sup_step  # Pass step index for DIS
                     )
                     # Scale loss for accumulation
                     loss = outputs['loss'] / acc_steps
@@ -425,7 +452,19 @@ class Trainer:
         total_loss = 0.0
 
         # N_sup Deep Supervision Loop
-        N_sup = self.model_config.N_supervision
+        N_sup = self.model_config.active_N_supervision
+
+        # Generate DIS targets if needed
+        if self.model_config.use_dis:
+            from .dis_utils import DISTargetGenerator
+            dis_generator = DISTargetGenerator(
+                vocab_size=self.model_config.vocab_size,
+                N_supervision=N_sup,
+                noise_schedule=self.model_config.dis_noise_schedule
+            )
+            targets = dis_generator.generate_targets(labels, self.device)
+        else:
+            targets = [labels] * N_sup
 
         for sup_step in range(N_sup):
             self.optimizer.zero_grad()
@@ -433,12 +472,13 @@ class Trainer:
             # Forward with AMP
             with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
                 outputs = self.model(
-                    labels=labels,
+                    labels=targets[sup_step],  # Use step-specific target
                     y=y,
                     z=z,
                     hidden_states=hidden_states,
                     cos=cos,
-                    sin=sin
+                    sin=sin,
+                    step_index=sup_step  # Pass step index for DIS
                 )
                 loss = outputs['loss']
 
@@ -494,11 +534,13 @@ class Trainer:
 
                 # Run full N_sup supervision for evaluation
                 y, z = None, None
-                for _ in range(self.model_config.N_supervision):
+                N_sup = self.model_config.active_N_supervision
+                for step in range(N_sup):
                     outputs = self.model(
                         labels=labels, y=y, z=z,
                         hidden_states=hidden_states,
-                        cos=cos, sin=sin
+                        cos=cos, sin=sin,
+                        step_index=step
                     )
                     y = outputs['y']
                     z = outputs['z']

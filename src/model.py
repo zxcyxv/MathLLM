@@ -40,7 +40,7 @@ class QwenTRM(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.T = config.T_recursion  # T = 3
+        self.T = config.active_T_recursion  # T = 3 (or 1 in DIS mode)
 
         # Backbone (Qwen) - to be set later or passed in
         self.backbone = backbone
@@ -161,7 +161,8 @@ class QwenTRM(nn.Module):
         z: Optional[torch.Tensor] = None,
         hidden_states: Optional[torch.Tensor] = None,
         cos: Optional[torch.Tensor] = None,
-        sin: Optional[torch.Tensor] = None
+        sin: Optional[torch.Tensor] = None,
+        step_index: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         One deep_recursion call (Paper Figure 3).
@@ -175,6 +176,7 @@ class QwenTRM(nn.Module):
             hidden_states: Pre-computed backbone output [B, S, backbone_dim]
                           (optional, skips backbone if provided)
             cos, sin: Pre-computed RoPE embeddings (optional, computed if not provided)
+            step_index: Optional supervision step index for DIS time embedding
 
         Returns:
             dict containing:
@@ -198,7 +200,7 @@ class QwenTRM(nn.Module):
 
         # Initialize states if first supervision step
         if y is None or z is None:
-            y, z = self.interface.initialize_states(x)
+            y, z = self.interface.initialize_states(x, step_index=step_index)
 
         # Get RoPE embeddings (compute once, reuse across supervision steps)
         if cos is None or sin is None:
@@ -279,7 +281,7 @@ class QwenTRM(nn.Module):
             Generated token IDs [B, S + generated_tokens]
         """
         if num_supervision_steps is None:
-            num_supervision_steps = self.config.N_supervision
+            num_supervision_steps = self.config.active_N_supervision
 
         self.eval()
         B = input_ids.size(0)
@@ -300,7 +302,9 @@ class QwenTRM(nn.Module):
             x_cache = hidden_states  # [B, S, D]
 
             # Initialize y, z for all positions
-            y_cache, z_cache = self.interface.initialize_states(x_cache)
+            # DIS: Use final denoising step (least noise) for best quality
+            step_index = num_supervision_steps - 1 if self.config.use_dis else None
+            y_cache, z_cache = self.interface.initialize_states(x_cache, step_index=step_index)
 
             # Compute full RoPE for max sequence length (cache for reuse)
             max_seq = S + max_new_tokens

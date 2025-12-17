@@ -202,6 +202,13 @@ def main():
     parser.add_argument("--T_recursion", type=int, default=3, help="Level 2: T")
     parser.add_argument("--N_supervision", type=int, default=16, help="Level 1: N_sup")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile for speedup")
+
+    # DIS (Deep Improvement Supervision) specific
+    parser.add_argument("--use_dis", action="store_true",
+                        help="Enable DIS mode (progressive target supervision)")
+    parser.add_argument("--dis_noise_schedule", type=str, default="linear",
+                        choices=["linear", "cosine"],
+                        help="Noise schedule for DIS target corruption")
     parser.add_argument("--gradient_accumulation", type=int, default=1,
                         help="Gradient accumulation steps (effective batch = batch_size * this)")
 
@@ -232,7 +239,9 @@ def main():
     trm_config = TRMConfig(
         n_latent=args.n_latent,
         T_recursion=args.T_recursion,
-        N_supervision=args.N_supervision
+        N_supervision=args.N_supervision,
+        use_dis=args.use_dis,
+        dis_noise_schedule=args.dis_noise_schedule
     )
 
     # Load QwenTRM
@@ -281,10 +290,19 @@ def main():
 
     trainable, total = count_trainable_params(model)
     print(f"\nTRM Configuration:")
-    print(f"  n_latent (Level 3): {args.n_latent}")
-    print(f"  T_recursion (Level 2): {args.T_recursion}")
-    print(f"  N_supervision (Level 1): {args.N_supervision}")
-    print(f"  Effective depth: {2 * (args.n_latent + 1) * args.T_recursion * args.N_supervision}")
+    if trm_config.use_dis:
+        print(f"  Mode: DIS (Deep Improvement Supervision)")
+        print(f"  n_latent (Level 3): {trm_config.active_n_latent} (DIS: {trm_config.dis_n_latent}, Standard: {trm_config.n_latent})")
+        print(f"  T_recursion (Level 2): {trm_config.active_T_recursion} (DIS: {trm_config.dis_T_recursion}, Standard: {trm_config.T_recursion})")
+        print(f"  N_supervision (Level 1): {trm_config.active_N_supervision} (DIS: {trm_config.dis_N_supervision}, Standard: {trm_config.N_supervision})")
+        print(f"  Noise schedule: {trm_config.dis_noise_schedule}")
+        print(f"  Effective depth: {2 * (trm_config.active_n_latent + 1) * trm_config.active_T_recursion * trm_config.active_N_supervision} (vs {2 * (trm_config.n_latent + 1) * trm_config.T_recursion * trm_config.N_supervision} in standard TRM)")
+    else:
+        print(f"  Mode: Standard TRM")
+        print(f"  n_latent (Level 3): {trm_config.n_latent}")
+        print(f"  T_recursion (Level 2): {trm_config.T_recursion}")
+        print(f"  N_supervision (Level 1): {trm_config.N_supervision}")
+        print(f"  Effective depth: {2 * (trm_config.n_latent + 1) * trm_config.T_recursion * trm_config.N_supervision}")
     print(f"  Trainable params: {trainable:,}")
     print(f"  Total params: {total:,}")
     print(f"  torch.compile: {args.compile}")
